@@ -1,0 +1,162 @@
+Running test case from test_case3-3.txt
+--------------------------------------------------
+db> PUT E 1
+PUT E 1 -> stored
+db> PUT F 1
+PUT F 1 -> stored
+db> PUT E (E+1)
+PUT E (E+1) -> stored
+db> PUT F (F+1)
+PUT F (F+1) -> stored
+db> GET E
+GET E -> 2
+db> DEL E
+DEL E -> deleted
+db> GET F
+GET F -> 2
+db> DEL F
+DEL F -> deleted
+db> PUT E 1
+PUT E 1 -> stored
+db> PUT F 1
+PUT F 1 -> stored
+db> PUT E (E+1)
+PUT E (E+1) -> stored
+db> PUT F (F+1)
+PUT F (F+1) -> stored
+db> GET E
+GET E -> 2
+db> DEL E
+DEL E -> deleted
+db> GET F
+GET F -> 2
+db> DEL F
+DEL F -> deleted
+db> PUT E 1
+PUT E 1 -> stored
+db> PUT F 1
+PUT F 1 -> stored
+db> PUT E (E+1)
+PUT E (E+1) -> stored
+db> PUT F (F+1)
+PUT F (F+1) -> stored
+db> GET E
+GET E -> 2
+db> DEL E
+DEL E -> deleted
+db> GET F
+GET F -> 2
+db> DEL F
+DEL F -> deleted
+db> PUT E 1
+PUT E 1 -> stored
+db> PUT F 1
+PUT F 1 -> stored
+db> PUT E (E+1)
+PUT E (E+1) -> stored
+db> PUT F (F+1)
+PUT F (F+1) -> stored
+db> GET E
+GET E -> 2
+db> DEL E
+DEL E -> deleted
+db> GET F
+GET F -> 2
+db> DEL F
+DEL F -> deleted
+db> PUT E 1
+PUT E 1 -> stored
+db> PUT F 1
+PUT F 1 -> stored
+db> PUT E (E+1)
+PUT E (E+1) -> stored
+db> PUT F (F+1)
+PUT F (F+1) -> stored
+db> GET E
+GET E -> 2
+db> DEL E
+DEL E -> deleted
+db> GET F
+GET F -> 2
+db> DEL F
+DEL F -> deleted
+db> PUT E 1
+PUT E 1 -> stored
+db> PUT F 1
+PUT F 1 -> stored
+db> PUT E (E+1)
+PUT E (E+1) -> stored
+db> PUT F (F+1)
+PUT F (F+1) -> stored
+db> GET E
+GET E -> 2
+db> DEL E
+DEL E -> deleted
+db> GET F
+GET F -> 2
+db> DEL F
+DEL F -> deleted
+db> PUT E 1
+PUT E 1 -> stored
+db> PUT F 1
+PUT F 1 -> stored
+db> PUT E (E+1)
+PUT E (E+1) -> stored
+db> PUT F (F+1)
+PUT F (F+1) -> stored
+db> GET E
+GET E -> 2
+db> DEL E
+DEL E -> deleted
+db> GET F
+GET F -> 2
+db> DEL F
+DEL F -> deleted
+db> PUT E 1
+PUT E 1 -> stored
+db> PUT F 1
+PUT F 1 -> stored
+db> PUT E (E+1)
+PUT E (E+1) -> stored
+db> PUT F (F+1)
+PUT F (F+1) -> stored
+db> GET E
+GET E -> 2
+db> DEL E
+DEL E -> deleted
+db> GET F
+GET F -> 2
+db> DEL F
+DEL F -> deleted
+db> PUT E 1
+PUT E 1 -> stored
+db> PUT F 1
+PUT F 1 -> stored
+db> PUT E (E+1)
+PUT E (E+1) -> stored
+db> PUT F (F+1)
+PUT F (F+1) -> stored
+db> GET E
+GET E -> 2
+db> DEL E
+DEL E -> deleted
+db> GET F
+GET F -> 2
+db> DEL F
+DEL F -> deleted
+db> PUT E 1
+PUT E 1 -> stored
+db> PUT F 1
+PUT F 1 -> stored
+db> PUT E (E+1)
+PUT E (E+1) -> stored
+db> PUT F (F+1)
+PUT F (F+1) -> stored
+db> GET E
+GET E -> 2
+db> DEL E
+DEL E -> deleted
+db> GET F
+GET F -> 2
+db> DEL F
+DEL F -> deleted

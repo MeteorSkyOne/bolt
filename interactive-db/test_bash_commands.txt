@@ -1,0 +1,4 @@
+# 测试标准化命令的批处理文件
+OPEN
+EXECUTE 2 output.txt test_case1.txt 3 -1 test_case4-2.txt -1 5
+CLOSE 

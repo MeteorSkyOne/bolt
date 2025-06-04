@@ -19,7 +19,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/boltdb/bolt"
+	"github.com/meteorsky/bolt"
 )
 
 var statsFlag = flag.Bool("stats", false, "show performance stats")
@@ -1131,7 +1131,7 @@ func ExampleDB_View() {
 	// John's last name is doe.
 }
 
-func ExampleDB_Begin_ReadOnly() {
+func ExampleDB_Begin() {
 	// Open the database.
 	db, err := bolt.Open(tempfile(), 0666, nil)
 	if err != nil {

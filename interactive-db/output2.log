@@ -1,0 +1,178 @@
+Running test case from test_case3-2.txt
+--------------------------------------------------
+db> PUT C 1
+PUT C 1 -> stored
+db> PUT D 1
+PUT D 1 -> stored
+db> PUT C (C+1)
+PUT C (C+1) -> stored
+db> PUT D (D+1)
+PUT D (D+1) -> stored
+db> GET C
+GET C -> 2
+db> DEL C
+DEL C -> deleted
+db> GET D
+GET D -> 2
+db> DEL D
+DEL D -> deleted
+db> PUT C 1
+PUT C 1 -> stored
+db> PUT D 1
+PUT D 1 -> stored
+db> PUT C (C+1)
+PUT C (C+1) -> stored
+db> PUT D (D+1)
+PUT D (D+1) -> stored
+db> GET C
+GET C -> 2
+db> DEL C
+DEL C -> deleted
+db> GET D
+GET D -> 2
+db> DEL D
+DEL D -> deleted
+db> PUT C 1
+PUT C 1 -> stored
+db> PUT D 1
+PUT D 1 -> stored
+db> PUT C (C+1)
+PUT C (C+1) -> stored
+db> PUT D (D+1)
+PUT D (D+1) -> stored
+db> GET C
+GET C -> 2
+db> DEL C
+DEL C -> deleted
+db> GET D
+GET D -> 2
+db> DEL D
+DEL D -> deleted
+db> PUT C 1
+PUT C 1 -> stored
+db> PUT D 1
+PUT D 1 -> stored
+db> PUT C (C+1)
+PUT C (C+1) -> stored
+db> PUT D (D+1)
+PUT D (D+1) -> stored
+db> GET C
+GET C -> 2
+db> DEL C
+DEL C -> deleted
+db> GET D
+GET D -> 2
+db> DEL D
+DEL D -> deleted
+db> PUT C 1
+PUT C 1 -> stored
+db> PUT D 1
+PUT D 1 -> stored
+db> PUT C (C+1)
+PUT C (C+1) -> stored
+db> PUT D (D+1)
+PUT D (D+1) -> stored
+db> GET C
+GET C -> 2
+db> DEL C
+DEL C -> deleted
+db> GET D
+GET D -> 2
+db> DEL D
+DEL D -> deleted
+db> PUT C 1
+PUT C 1 -> stored
+db> PUT D 1
+PUT D 1 -> stored
+db> PUT C (C+1)
+PUT C (C+1) -> stored
+db> PUT D (D+1)
+PUT D (D+1) -> stored
+db> GET C
+GET C -> 2
+db> DEL C
+DEL C -> deleted
+db> GET D
+GET D -> 2
+db> DEL D
+DEL D -> deleted
+db> PUT C 1
+PUT C 1 -> stored
+db> PUT D 1
+PUT D 1 -> stored
+db> PUT C (C+1)
+PUT C (C+1) -> stored
+db> PUT D (D+1)
+PUT D (D+1) -> stored
+db> GET C
+GET C -> 2
+db> DEL C
+DEL C -> deleted
+db> GET D
+GET D -> 2
+db> DEL D
+DEL D -> deleted
+db> PUT C 1
+PUT C 1 -> stored
+db> PUT D 1
+PUT D 1 -> stored
+db> PUT C (C+1)
+PUT C (C+1) -> stored
+db> PUT D (D+1)
+PUT D (D+1) -> stored
+db> GET C
+GET C -> 2
+db> DEL C
+DEL C -> deleted
+db> GET D
+GET D -> 2
+db> DEL D
+DEL D -> deleted
+db> PUT C 1
+PUT C 1 -> stored
+db> PUT D 1
+PUT D 1 -> stored
+db> PUT C (C+1)
+PUT C (C+1) -> stored
+db> PUT D (D+1)
+PUT D (D+1) -> stored
+db> GET C
+GET C -> 2
+db> DEL C
+DEL C -> deleted
+db> GET D
+GET D -> 2
+db> DEL D
+DEL D -> deleted
+db> PUT C 1
+PUT C 1 -> stored
+db> PUT D 1
+PUT D 1 -> stored
+db> PUT C (C+1)
+PUT C (C+1) -> stored
+db> PUT D (D+1)
+PUT D (D+1) -> stored
+db> GET C
+GET C -> 2
+db> DEL C
+DEL C -> deleted
+db> GET D
+GET D -> 2
+db> DEL D
+DEL D -> deleted
+db> PUT C 1
+PUT C 1 -> stored
+db> PUT D 1
+PUT D 1 -> stored
+db> PUT C (C+1)
+PUT C (C+1) -> stored
+db> PUT D (D+1)
+PUT D (D+1) -> stored
+db> GET C
+GET C -> 2
+db> DEL C
+DEL C -> deleted
+db> GET D
+GET D -> 2
+db> DEL D
+DEL D -> deleted

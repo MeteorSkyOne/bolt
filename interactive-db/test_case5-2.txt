@@ -1,0 +1,31 @@
+# 测试用例5-2：写操作事务（2个进程循环执行）
+BEGIN
+PUT A (A+1)
+PUT B (B+1)
+PUT A (B+1)
+PUT B (A+1)
+COMMIT
+BEGIN
+PUT A (A+1)
+PUT B (B+1)
+PUT A (B+1)
+PUT B (A+1)
+COMMIT
+BEGIN
+PUT A (A+1)
+PUT B (B+1)
+PUT A (B+1)
+PUT B (A+1)
+COMMIT
+BEGIN
+PUT A (A+1)
+PUT B (B+1)
+PUT A (B+1)
+PUT B (A+1)
+COMMIT
+BEGIN
+PUT A (A+1)
+PUT B (B+1)
+PUT A (B+1)
+PUT B (A+1)
+COMMIT 

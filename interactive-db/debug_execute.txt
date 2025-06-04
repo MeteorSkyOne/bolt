@@ -1,0 +1,4 @@
+# 调试EXECUTE命令
+OPEN
+EXECUTE 1 debug_output.txt test_simple.txt 1 -1
+CLOSE 

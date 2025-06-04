@@ -1,0 +1,16 @@
+Running test case from test_conflict.txt
+--------------------------------------------------
+db> PUT SHARED 0
+PUT SHARED 0 -> stored
+db> PUT SHARED (SHARED+1)
+PUT SHARED (SHARED+1) -> stored
+db> PUT SHARED (SHARED+1)
+PUT SHARED (SHARED+1) -> stored
+db> PUT SHARED (SHARED+1)
+PUT SHARED (SHARED+1) -> stored
+db> PUT SHARED (SHARED+1)
+PUT SHARED (SHARED+1) -> stored
+db> PUT SHARED (SHARED+1)
+PUT SHARED (SHARED+1) -> stored
+db> GET SHARED
+GET SHARED -> 5
