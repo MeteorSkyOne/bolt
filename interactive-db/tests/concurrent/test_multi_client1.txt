@@ -1,0 +1,15 @@
+# 客户端1 - 基础操作测试
+PUT client1_key 100
+GET client1_key
+PUT shared_counter 1
+GET shared_counter
+
+# 事务测试
+BEGIN
+PUT client1_key (client1_key+10)
+PUT shared_counter (shared_counter+1)
+GET client1_key
+GET shared_counter
+COMMIT
+
+SHOW 

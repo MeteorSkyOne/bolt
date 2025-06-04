@@ -1,0 +1,11 @@
+BEGIN
+
+GET A
+
+GET B
+
+GET A
+
+GET B
+
+COMMIT

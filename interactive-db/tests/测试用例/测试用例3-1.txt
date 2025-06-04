@@ -1,0 +1,15 @@
+PUT A 1 
+
+PUT B 1 
+
+PUT A (A+1) 
+
+PUT B (B+1) 
+
+GET A 
+
+DEL A 
+
+GET B 
+
+DEL B

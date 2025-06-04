@@ -1,0 +1,15 @@
+PUT E 1 
+
+PUT F 1 
+
+PUT E (E+1) 
+
+PUT F (F+1) 
+
+GET E 
+
+DEL E 
+
+GET F 
+
+DEL F

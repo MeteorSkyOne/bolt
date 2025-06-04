@@ -1,0 +1,19 @@
+# 基础操作测试
+# 测试PUT、GET、DEL和SHOW命令
+
+PUT key1 100
+PUT key2 200
+GET key1
+GET key2
+SHOW
+
+# 测试表达式计算
+PUT base 10
+PUT result (base+5)
+GET base
+GET result
+
+# 测试删除操作
+DEL key1
+GET key1
+SHOW 

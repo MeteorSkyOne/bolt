@@ -1,0 +1,25 @@
+# 单客户端事务测试
+# 测试BEGIN、COMMIT、ABORT功能
+
+# 初始化数据
+PUT account_a 1000
+PUT account_b 2000
+SHOW
+
+# 成功事务：转账操作
+BEGIN
+PUT account_a (account_a-100)
+PUT account_b (account_b+100)
+GET account_a
+GET account_b
+COMMIT
+SHOW
+
+# 失败事务：回滚操作
+BEGIN
+PUT account_a (account_a-500)
+PUT account_b (account_b+500)
+GET account_a
+GET account_b
+ABORT
+SHOW 

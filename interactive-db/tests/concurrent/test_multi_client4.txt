@@ -1,0 +1,15 @@
+# 客户端4 - 删除操作和最终检查
+GET client1_key
+GET client2_key
+GET client3_key
+GET shared_counter
+
+# 删除操作测试
+DEL client2_data
+PUT cleanup_key 1
+
+# 查看最终状态
+SHOW
+
+# 清理部分数据
+DEL cleanup_key 

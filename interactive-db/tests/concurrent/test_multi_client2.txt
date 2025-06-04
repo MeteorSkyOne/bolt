@@ -1,0 +1,16 @@
+# 客户端2 - 并发写操作测试
+PUT client2_key 200
+GET client2_key
+GET shared_counter
+
+# 并发事务测试
+BEGIN
+PUT client2_key (client2_key+20)
+PUT shared_counter (shared_counter+2)
+PUT client2_data 999
+GET client2_key
+GET shared_counter
+COMMIT
+
+GET client1_key
+SHOW 

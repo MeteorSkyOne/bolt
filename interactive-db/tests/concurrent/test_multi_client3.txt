@@ -1,0 +1,20 @@
+# 客户端3 - 读操作和事务冲突测试
+PUT client3_key 300
+GET client1_key
+GET client2_key
+GET shared_counter
+
+# 事务中断测试
+BEGIN
+PUT client3_key (client3_key+30)
+PUT shared_counter (shared_counter+3)
+GET client3_key
+ABORT
+
+# 重新开始事务
+BEGIN
+PUT client3_key (client3_key+5)
+GET client3_key
+COMMIT
+
+SHOW

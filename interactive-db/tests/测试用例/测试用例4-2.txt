@@ -1,0 +1,35 @@
+BEGIN 
+
+PUT A (A+1) 
+
+PUT B (B+1) 
+
+PUT A (A+1) 
+
+PUT B (B+1) 
+
+COMMIT 
+
+BEGIN 
+
+GET A 
+
+GET B
+
+COMMIT 
+
+BEGIN 
+
+GET A 
+
+GET B
+
+COMMIT 
+
+BEGIN 
+
+PUT A (A-1) 
+
+PUT B (B-1) 
+
+ABORT

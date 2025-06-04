@@ -1,0 +1,8 @@
+# Test file 2 for EXECUTE command
+BEGIN
+PUT keyA valueA
+PUT keyB valueB
+COMMIT
+GET keyA
+GET keyB
+SHOW 

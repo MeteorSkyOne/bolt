@@ -1,0 +1,6 @@
+# Test file 1 for EXECUTE command
+PUT key1 value1
+PUT key2 value2
+GET key1
+GET key2
+SHOW 

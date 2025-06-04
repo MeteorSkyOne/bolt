@@ -1,0 +1,10 @@
+PUT A 0
+
+PUT B 0
+
+PUT A (A+1)
+
+PUT B (B+1)
+
+PUT A (A+1)
+

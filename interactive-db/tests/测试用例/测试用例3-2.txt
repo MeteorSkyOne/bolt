@@ -1,0 +1,15 @@
+PUT C 1 
+
+PUT D 1 
+
+PUT C (C+1) 
+
+PUT D (D+1) 
+
+GET C 
+
+DEL C 
+
+GET D 
+
+DEL D

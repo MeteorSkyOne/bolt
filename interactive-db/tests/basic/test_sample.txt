@@ -1,0 +1,29 @@
+# 客户端-服务器测试示例
+# 可以使用：go run ./cmd/client --batch test_sample.txt
+
+# 基本操作测试
+PUT A 5
+PUT B 10
+GET A
+GET B
+SHOW
+
+# 表达式操作测试
+PUT C (A+3)
+PUT D (B-2)
+GET C
+GET D
+
+# 事务测试
+BEGIN
+PUT A (A+1)
+PUT B (B+1)
+GET A
+GET B
+COMMIT
+SHOW
+
+# 删除操作测试
+DEL C
+DEL D
+SHOW 

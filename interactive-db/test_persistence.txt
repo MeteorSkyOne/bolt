@@ -1,3 +1,0 @@
-SHOW
-GET A
-GET B 

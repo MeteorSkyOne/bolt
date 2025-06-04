@@ -1,5 +1,0 @@
-PUT X 10
-PUT Y (X+5)
-GET X
-GET Y
-SHOW 
