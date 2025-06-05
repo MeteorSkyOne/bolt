@@ -5,12 +5,53 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "client",
+            "type": "go",
+            "request": "launch",
+            "mode": "debug",
+            "program": "${workspaceFolder}/interactive-db/cmd/client/client.go",
+            "args": ["-port=9090"]
+        },
+        {
+            "name": "cn",
+            "type": "go",
+            "request": "launch",
+            "mode": "debug",
+            "program": "${workspaceFolder}/interactive-db/cmd/coordinator/cn.go"
+        },
+        {
             "name": "server1",
             "type": "go",
             "request": "launch",
             "mode": "debug",
-            "program": "${file}",
-            "args": ["-port=18081", "-id=1", "-db", "server1.db", "-cn", "localhost:9091"]
+            "program": "${workspaceFolder}/interactive-db/cmd/server/server.go",
+            "args": ["-port=18081", "-id=1", "-db", "server1.db"]
+        },
+        {
+            "name": "server2",
+            "type": "go",
+            "request": "launch",
+            "mode": "debug",
+            "program": "${workspaceFolder}/interactive-db/cmd/server/server.go",
+            "args": [
+                "-port=28080",
+                "-id=2",
+                "-db",
+                "server2.db"
+            ]
+        },
+        {
+            "name": "server3",
+            "type": "go",
+            "request": "launch",
+            "mode": "debug",
+            "program": "${workspaceFolder}/interactive-db/cmd/server/server.go",
+            "args": [
+                "-port=38081",
+                "-id=3",
+                "-db",
+                "server3.db"
+            ]
         },
         {
             "name": "Attach to Process",

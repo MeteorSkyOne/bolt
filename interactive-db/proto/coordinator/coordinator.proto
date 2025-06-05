@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+option go_package = "interactive-db/proto/coordinator";
+
+package coordinator;
+
+// 协调器服务
+service CoordinatorService {
+  // 服务器注册
+  rpc RegisterServer(RegisterRequest) returns (RegisterResponse);
+  
+  // 心跳
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  
+  // 数据备份流（从server到cn）
+  rpc StreamBackup(BackupRequest) returns (stream BackupChunk);
+  
+  // 数据恢复流（从cn到server）
+  rpc StreamRestore(stream RestoreChunk) returns (RestoreResponse);
+}
+
+// 注册请求
+message RegisterRequest {
+  string node_id = 1;
+  string address = 2;
+  string port = 3;
+  int64 lsn = 4;  // 节点当前LSN，用于选举决策
+}
+
+// 注册响应
+message RegisterResponse {
+  bool success = 1;
+  string role = 2;
+  string message = 3;
+}
+
+// 心跳请求
+message HeartbeatRequest {
+  string node_id = 1;
+  int64 lsn = 2;
+}
+
+// 心跳响应
+message HeartbeatResponse {
+  bool success = 1;
+  int64 timestamp = 2;
+}
+
+// 备份请求
+message BackupRequest {
+  string node_id = 1;
+}
+
+// 备份数据块
+message BackupChunk {
+  bytes data = 1;
+  int64 total_size = 2;
+  bool is_last = 3;
+}
+
+// 恢复数据块
+message RestoreChunk {
+  bytes data = 1;
+  int64 total_size = 2;
+  bool is_last = 3;
+}
+
+// 恢复响应
+message RestoreResponse {
+  bool success = 1;
+  string message = 2;
+} 

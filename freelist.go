@@ -201,11 +201,15 @@ func (f *freelist) write(p *page) error {
 		p.count = uint16(lenids)
 	} else if lenids < 0xFFFF {
 		p.count = uint16(lenids)
-		f.copyall(((*[maxAllocSize]pgid)(unsafe.Pointer(&p.ptr)))[:])
+		// Properly bound the slice to prevent race conditions
+		ids := ((*[maxAllocSize]pgid)(unsafe.Pointer(&p.ptr)))[:lenids:lenids]
+		f.copyall(ids)
 	} else {
 		p.count = 0xFFFF
 		((*[maxAllocSize]pgid)(unsafe.Pointer(&p.ptr)))[0] = pgid(lenids)
-		f.copyall(((*[maxAllocSize]pgid)(unsafe.Pointer(&p.ptr)))[1:])
+		// Properly bound the slice to prevent race conditions
+		ids := ((*[maxAllocSize]pgid)(unsafe.Pointer(&p.ptr)))[1 : 1+lenids : 1+lenids]
+		f.copyall(ids)
 	}
 
 	return nil

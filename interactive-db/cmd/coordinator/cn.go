@@ -2,10 +2,12 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
+	"context"
 	"flag"
 	"fmt"
 	"interactive-db/pkg/logger"
+	pb "interactive-db/proto/coordinator"
+	serverpb "interactive-db/proto/server"
 	"io"
 	"math/rand"
 	"net"
@@ -14,20 +16,24 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 )
 
 const (
-	defaultPort       = "9090" // CN节点监听端口
-	defaultServerPort = "8080" // 注册server的端口
-	minNodes          = 3      // 最少节点数
-	heartbeatInterval = 5 * time.Second
-	heartbeatTimeout  = 15 * time.Second
+	defaultPort       = "9090"           // CN节点监听端口
+	defaultGRPCPort   = "9091"           // gRPC服务端口
+	minNodes          = 3                // 最少节点数
+	heartbeatInterval = 10 * time.Second // 调整为10秒，避免过于频繁
+	heartbeatTimeout  = 20 * time.Second // 相应调整超时时间
 
-	// 同步控制参数
-	lsnSyncThreshold  = 10               // LSN差异超过10才触发同步
-	syncCooldown      = 10 * time.Second // 同步冷却时间10秒
+	// 同步控制参数 - 改为定时同步策略
+	syncInterval      = 10 * time.Second // 定时同步间隔（不再基于LSN阈值）
+	syncCooldown      = 5 * time.Second  // 同步失败后的冷却时间
 	maxSyncRetries    = 3                // 最大重试次数
-	syncCheckInterval = 15 * time.Second // 数据追赶检测间隔
+	syncCheckInterval = 8 * time.Second  // 数据追赶检测间隔（更频繁）
 )
 
 // NodeStatus 节点状态
@@ -73,16 +79,19 @@ func (r NodeRole) String() string {
 
 // ServerNode 服务器节点信息
 type ServerNode struct {
-	ID             string     `json:"id"`
-	Address        string     `json:"address"`
-	Port           string     `json:"port"`
-	Role           NodeRole   `json:"role"`
-	Status         NodeStatus `json:"status"`
-	LSN            int64      `json:"lsn"` // Log Sequence Number
-	LastSeen       time.Time  `json:"last_seen"`
-	LastSyncTime   time.Time  `json:"last_sync_time"`   // 上次同步时间
-	SyncRetryCount int        `json:"sync_retry_count"` // 当前重试次数
-	conn           net.Conn   // 到该节点的连接
+	ID             string                         `json:"id"`
+	Address        string                         `json:"address"`
+	Port           string                         `json:"port"`
+	GRPCPort       string                         // gRPC端口
+	Role           NodeRole                       `json:"role"`
+	Status         NodeStatus                     `json:"status"`
+	LSN            int64                          `json:"lsn"` // Log Sequence Number
+	LastSeen       time.Time                      `json:"last_seen"`
+	LastSyncTime   time.Time                      `json:"last_sync_time"`   // 上次同步时间
+	SyncRetryCount int                            `json:"sync_retry_count"` // 当前重试次数
+	conn           net.Conn                       // 到该节点的连接（TCP，用于客户端请求转发）
+	grpcConn       *grpc.ClientConn               // gRPC连接
+	grpcClient     serverpb.DatabaseServiceClient // gRPC客户端
 }
 
 // ClientSession 客户端会话
@@ -92,50 +101,63 @@ type ClientSession struct {
 	serverConn net.Conn // 到服务器的连接
 }
 
-// RegisterRequest 节点注册请求
-type RegisterRequest struct {
-	NodeID  string `json:"node_id"`
-	Address string `json:"address"`
-	Port    string `json:"port"`
-}
-
-// HeartbeatRequest 心跳请求
-type HeartbeatRequest struct {
-	NodeID string `json:"node_id"`
-	LSN    int64  `json:"lsn"`
-}
-
 // CoordinatorNode CN节点
 type CoordinatorNode struct {
+	pb.UnimplementedCoordinatorServiceServer
 	port        string
+	grpcPort    string
 	serverNodes map[string]*ServerNode
 	clients     map[string]*ClientSession
 	primaryNode *ServerNode
 	mu          sync.RWMutex
 	started     bool
 	startTime   time.Time
+	grpcServer  *grpc.Server
 }
 
 // NewCoordinatorNode 创建新的协调节点
-func NewCoordinatorNode(port string) *CoordinatorNode {
-	return &CoordinatorNode{
+func NewCoordinatorNode(port, grpcPort string) *CoordinatorNode {
+	cn := &CoordinatorNode{
 		port:        port,
+		grpcPort:    grpcPort,
 		serverNodes: make(map[string]*ServerNode),
 		clients:     make(map[string]*ClientSession),
 		started:     false,
+		grpcServer: grpc.NewServer(
+			grpc.KeepaliveParams(keepalive.ServerParameters{
+				Time:    30 * time.Second, // 增加服务器发送keepalive ping的时间间隔
+				Timeout: 10 * time.Second, // 增加等待keepalive ping应答的超时时间
+			}),
+			grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+				MinTime:             10 * time.Second, // 增加客户端keepalive ping的最小时间间隔
+				PermitWithoutStream: true,             // 允许在没有活跃流时发送keepalive ping
+			}),
+		),
 	}
+
+	// 注册gRPC服务
+	pb.RegisterCoordinatorServiceServer(cn.grpcServer, cn)
+
+	return cn
 }
 
 // Start 启动协调节点
 func (cn *CoordinatorNode) Start() error {
-	// 启动客户端监听服务
+	// 启动gRPC服务器
+	grpcListener, err := net.Listen("tcp", ":"+cn.grpcPort)
+	if err != nil {
+		return fmt.Errorf("failed to start gRPC server: %v", err)
+	}
+
+	go func() {
+		logger.Info("gRPC server started on port %s", cn.grpcPort)
+		if err := cn.grpcServer.Serve(grpcListener); err != nil {
+			logger.Error("gRPC server error: %v", err)
+		}
+	}()
+
+	// 启动客户端监听服务（保留原有的客户端连接功能）
 	go cn.startClientListener()
-
-	// 启动服务器注册监听服务
-	go cn.startServerListener()
-
-	// 启动心跳监听服务
-	go cn.startHeartbeatListener()
 
 	// 启动心跳检测
 	go cn.startHeartbeatChecker()
@@ -143,7 +165,9 @@ func (cn *CoordinatorNode) Start() error {
 	// 启动数据追赶监控器
 	go cn.startDataCatchupMonitor()
 
-	logger.Info("Coordinator Node started on port %s", cn.port)
+	logger.Info("Coordinator Node started")
+	logger.Info("Client connections on port %s", cn.port)
+	logger.Info("gRPC services on port %s", cn.grpcPort)
 	logger.Info("Waiting for at least %d server nodes to register...", minNodes)
 
 	// 阻塞主线程
@@ -183,93 +207,7 @@ func (cn *CoordinatorNode) startClientListener() {
 	}
 }
 
-// startServerListener 启动服务器注册监听
-func (cn *CoordinatorNode) startServerListener() {
-	serverPort := "9091" // 服务器注册端口
-	listener, err := net.Listen("tcp", ":"+serverPort)
-	if err != nil {
-		logger.Error("Failed to start server listener: %v", err)
-		return
-	}
-	defer listener.Close()
-
-	logger.Info("Server registration listener started on port %s", serverPort)
-
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			logger.Error("Failed to accept server connection: %v", err)
-			continue
-		}
-
-		go cn.handleServerRegistration(conn)
-	}
-}
-
-// handleServerRegistration 处理服务器注册
-func (cn *CoordinatorNode) handleServerRegistration(conn net.Conn) {
-	defer conn.Close()
-
-	logger.Info("New server connection from %s", conn.RemoteAddr())
-
-	decoder := json.NewDecoder(conn)
-	var req RegisterRequest
-
-	if err := decoder.Decode(&req); err != nil {
-		logger.Error("Failed to decode registration request: %v", err)
-		return
-	}
-
-	logger.Info("Server registration request from %s:%s (ID: %s)", req.Address, req.Port, req.NodeID)
-
-	// 创建服务器节点
-	node := &ServerNode{
-		ID:       req.NodeID,
-		Address:  req.Address,
-		Port:     req.Port,
-		Role:     NodeRoleReplica, // 默认为从节点
-		Status:   NodeStatusActive,
-		LSN:      0,
-		LastSeen: time.Now(),
-	}
-
-	cn.mu.Lock()
-	cn.serverNodes[req.NodeID] = node
-	nodeCount := len(cn.serverNodes)
-	needsCatchup := cn.started && cn.primaryNode != nil && cn.primaryNode.LSN > 0
-	cn.mu.Unlock()
-
-	logger.Info("Server %s registered successfully. Total nodes: %d", req.NodeID, nodeCount)
-
-	// 发送注册成功响应
-	response := map[string]interface{}{
-		"status": "success",
-		"role":   node.Role.String(),
-	}
-
-	logger.Info("Sending registration response to %s: %+v", req.NodeID, response)
-	encoder := json.NewEncoder(conn)
-	if err := encoder.Encode(response); err != nil {
-		logger.Error("Failed to send registration response to %s: %v", req.NodeID, err)
-	} else {
-		logger.Info("Registration response sent successfully to %s", req.NodeID)
-	}
-
-	// 检查是否可以启动系统
-	if !cn.started && nodeCount >= minNodes {
-		cn.startSystem()
-	} else {
-		// 打印当前注册的节点
-		logger.Info("Current registered nodes: %v", cn.serverNodes)
-	}
-
-	// 如果系统已启动且新节点需要追赶数据，启动数据同步
-	if needsCatchup {
-		go cn.performDataCatchup(node)
-	}
-}
-
-// connectToServer 连接到服务器节点
+// connectToServer 连接到服务器节点（用于客户端请求转发的TCP连接）
 func (cn *CoordinatorNode) connectToServer(node *ServerNode) (net.Conn, error) {
 	address := fmt.Sprintf("%s:%s", node.Address, node.Port)
 	conn, err := net.Dial("tcp", address)
@@ -290,24 +228,22 @@ func (cn *CoordinatorNode) startSystem() {
 
 	logger.Info("Starting distributed system with %d nodes", len(cn.serverNodes))
 
-	// 等待节点心跳更新LSN信息
-	logger.Info("Waiting for nodes to send heartbeat and update LSN...")
+	// 不要释放锁，直接等待心跳更新
+	// 心跳会在另一个goroutine中更新LSN，使用独立的锁机制
+	logger.Info("Waiting for initial heartbeat from nodes...")
 
-	// 解锁以允许心跳更新
-	cn.mu.Unlock()
-	time.Sleep(5 * time.Second) // 等待心跳
-	cn.mu.Lock()
+	// 标记系统为已启动，这样心跳可以正常处理
+	cn.started = true
+	cn.startTime = time.Now()
 
 	// 选举主节点
 	cn.electPrimaryNode()
 
 	if cn.primaryNode == nil {
 		logger.Error("Failed to elect primary node")
+		cn.started = false // 回滚启动状态
 		return
 	}
-
-	cn.started = true
-	cn.startTime = time.Now()
 
 	logger.Info("System started successfully. Primary node: %s", cn.primaryNode.ID)
 
@@ -639,358 +575,147 @@ func (cn *CoordinatorNode) checkNodeHealth() {
 	}
 }
 
-// startHeartbeatListener 启动心跳监听
-func (cn *CoordinatorNode) startHeartbeatListener() {
-	heartbeatPort := "9092" // 心跳监听端口
-	listener, err := net.Listen("tcp", ":"+heartbeatPort)
-	if err != nil {
-		logger.Error("Failed to start heartbeat listener: %v", err)
-		return
-	}
-	defer listener.Close()
-
-	logger.Info("Heartbeat listener started on port %s", heartbeatPort)
-
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			logger.Error("Failed to accept heartbeat connection: %v", err)
-			continue
-		}
-
-		go cn.handleHeartbeat(conn)
-	}
-}
-
-// handleHeartbeat 处理心跳请求
-func (cn *CoordinatorNode) handleHeartbeat(conn net.Conn) {
-	defer conn.Close()
-
-	decoder := json.NewDecoder(conn)
-	var req HeartbeatRequest
-
-	if err := decoder.Decode(&req); err != nil {
-		logger.Error("Failed to decode heartbeat request: %v", err)
-		return
-	}
-
-	// 更新节点的最后心跳时间和LSN
-	cn.mu.Lock()
-	if node, exists := cn.serverNodes[req.NodeID]; exists {
-		node.LastSeen = time.Now()
-		node.LSN = req.LSN
-		// 如果节点之前是DOWN状态，重新标记为ACTIVE
-		if node.Status == NodeStatusDown {
-			logger.Info("Node %s is back online", req.NodeID)
-			node.Status = NodeStatusActive
-		}
-	}
-	cn.mu.Unlock()
-
-	// 可选：发送心跳响应确认
-	response := map[string]interface{}{
-		"status": "ok",
-		"time":   time.Now().Unix(),
-	}
-	encoder := json.NewEncoder(conn)
-	encoder.Encode(response)
-}
-
 // sendCommandToNode 发送命令到指定节点（用于向从节点同步）
 func (cn *CoordinatorNode) sendCommandToNode(node *ServerNode, command string) (string, error) {
-	if node.conn == nil {
-		// 尝试重新连接
-		conn, err := cn.connectToServer(node)
-		if err != nil {
-			return "", err
-		}
-		node.conn = conn
-
-		// 读取并丢弃服务器的欢迎消息
-		scanner := bufio.NewScanner(node.conn)
-		// 读取第一行: "Connected to Interactive Database Server"
-		if scanner.Scan() {
-			// 丢弃欢迎消息
-		}
-		// 读取第二行: "Type 'HELP' for available commands, 'EXIT' to quit"
-		if scanner.Scan() {
-			// 丢弃提示消息
-		}
+	if node.grpcClient == nil {
+		return "", fmt.Errorf("gRPC client not initialized for node %s", node.ID)
 	}
 
-	// 发送命令
-	_, err := node.conn.Write([]byte(command + "\n"))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second) // 增加超时时间
+	defer cancel()
+
+	resp, err := node.grpcClient.ExecuteCommand(ctx, &serverpb.CommandRequest{
+		Command: command,
+	})
 	if err != nil {
-		// 连接可能断开，重置连接
-		node.conn = nil
 		return "", err
 	}
 
-	// 读取响应
-	scanner := bufio.NewScanner(node.conn)
-	if scanner.Scan() {
-		return scanner.Text(), nil
-	}
-
-	if err := scanner.Err(); err != nil {
-		node.conn = nil
-		return "", err
-	}
-
-	return "", fmt.Errorf("no response from node")
+	return resp.Result, nil
 }
 
 // streamBackupFromNode 从节点流式备份数据
 func (cn *CoordinatorNode) streamBackupFromNode(node *ServerNode) (io.ReadCloser, int64, error) {
-	// 计算备份端口
-	portNum, err := strconv.Atoi(node.Port)
+	if node.grpcClient == nil {
+		return nil, 0, fmt.Errorf("gRPC client not initialized for node %s", node.ID)
+	}
+
+	// 不要在这里使用带超时的context，因为stream可能需要长时间运行
+	// 改为使用一个可以手动控制的context
+	ctx := context.Background()
+
+	stream, err := node.grpcClient.StreamBackup(ctx, &serverpb.BackupRequest{
+		SourceNodeId: node.ID,
+	})
 	if err != nil {
-		return nil, 0, fmt.Errorf("invalid port number: %v", err)
-	}
-	backupPort := strconv.Itoa(portNum + 1000) // backupPortOffset = 1000
-
-	// 连接到备份端口
-	backupAddr := fmt.Sprintf("%s:%s", node.Address, backupPort)
-	logger.Info("Connecting to backup port: %s", backupAddr)
-
-	conn, err := net.DialTimeout("tcp", backupAddr, 10*time.Second)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to connect to backup port: %v", err)
+		return nil, 0, fmt.Errorf("failed to start backup stream: %v", err)
 	}
 
-	// 设置TCP选项
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		tcpConn.SetNoDelay(true)
-		tcpConn.SetKeepAlive(true)
-	}
+	// 创建管道用于流式读取
+	pr, pw := io.Pipe()
+	var totalSize int64
 
-	// 设置连接超时
-	conn.SetDeadline(time.Now().Add(10 * time.Minute))
+	// 启动goroutine从gRPC流读取数据并写入管道
+	go func() {
+		defer pw.Close()
 
-	// 发送BACKUP请求
-	_, err = conn.Write([]byte("BACKUP\n"))
-	if err != nil {
-		conn.Close()
-		return nil, 0, fmt.Errorf("failed to send backup request: %v", err)
-	}
+		for {
+			chunk, err := stream.Recv()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				logger.Error("Failed to receive backup chunk from %s: %v", node.ID, err)
+				pw.CloseWithError(err)
+				return
+			}
 
-	// 读取响应和数据大小
-	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	scanner := bufio.NewScanner(conn)
-	if !scanner.Scan() {
-		conn.Close()
-		return nil, 0, fmt.Errorf("failed to read backup response")
-	}
+			// 第一个块包含总大小
+			if totalSize == 0 {
+				totalSize = chunk.TotalSize
+			}
 
-	response := strings.TrimSpace(scanner.Text())
-	parts := strings.Fields(response)
-	if len(parts) != 2 || parts[0] != "OK" {
-		conn.Close()
-		return nil, 0, fmt.Errorf("backup request failed: %s", response)
-	}
+			// 写入数据到管道
+			if _, err := pw.Write(chunk.Data); err != nil {
+				logger.Error("Failed to write backup data: %v", err)
+				pw.CloseWithError(err)
+				return
+			}
 
-	dataSize, err := strconv.ParseInt(parts[1], 10, 64)
-	if err != nil {
-		conn.Close()
-		return nil, 0, fmt.Errorf("invalid data size in response: %s", parts[1])
-	}
+			if chunk.IsLast {
+				break
+			}
+		}
+	}()
 
-	// 清除读取超时，准备接收数据流
-	conn.SetReadDeadline(time.Time{})
-	logger.Info("Backup stream ready from %s, expecting %d bytes", node.ID, dataSize)
-
-	// 创建一个包装器来处理连接关闭和确认
-	wrapper := &backupStreamWrapper{
-		conn:     conn,
-		dataSize: dataSize,
-		node:     node,
-	}
-
-	// 返回包装器作为数据流和数据大小
-	return wrapper, dataSize, nil
-}
-
-// backupStreamWrapper 包装备份数据流连接
-type backupStreamWrapper struct {
-	conn     net.Conn
-	dataSize int64
-	node     *ServerNode
-	closed   bool
-}
-
-func (w *backupStreamWrapper) Read(p []byte) (n int, err error) {
-	return w.conn.Read(p)
-}
-
-func (w *backupStreamWrapper) Close() error {
-	if w.closed {
-		return nil
-	}
-	w.closed = true
-
-	// 发送确认消息
-	_, err := w.conn.Write([]byte("ACK\n"))
-	if err != nil {
-		logger.Info("Failed to send acknowledgment to %s: %v", w.node.ID, err)
-	} else {
-		logger.Info("Sent acknowledgment to %s", w.node.ID)
-	}
-
-	// 等待一小段时间确保确认被发送
+	// 等待第一个块来获取总大小
 	time.Sleep(100 * time.Millisecond)
 
-	return w.conn.Close()
+	logger.Info("Backup stream ready from %s via gRPC", node.ID)
+	return pr, totalSize, nil
 }
 
-// streamRestoreToNode 流式恢复数据到节点 - 增强版本，带重试机制
+// streamRestoreToNode 流式恢复数据到节点
 func (cn *CoordinatorNode) streamRestoreToNode(node *ServerNode, dataReader io.Reader, dataSize int64) error {
-	// 将数据读取到缓冲区，以便可以重试
-	dataBuffer := make([]byte, dataSize)
-	bytesRead, err := io.ReadFull(dataReader, dataBuffer)
+	if node.grpcClient == nil {
+		return fmt.Errorf("gRPC client not initialized for node %s", node.ID)
+	}
+
+	logger.Info("Starting gRPC stream restore to %s, size: %d bytes", node.ID, dataSize)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second) // 增加超时时间用于大数据传输
+	defer cancel()
+
+	stream, err := node.grpcClient.StreamRestore(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to read data into buffer: %v", err)
-	}
-	if int64(bytesRead) != dataSize {
-		return fmt.Errorf("read %d bytes, expected %d bytes", bytesRead, dataSize)
+		return fmt.Errorf("failed to start restore stream: %v", err)
 	}
 
-	logger.Info("Buffered %d bytes for restore to %s", dataSize, node.ID)
+	// 分块发送数据
+	chunkSize := 64 * 1024 // 64KB chunks
+	buffer := make([]byte, chunkSize)
+	var totalSent int64
 
-	// 重试机制
-	maxRetries := 3
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		logger.Info("Attempt %d/%d to restore data to %s", attempt, maxRetries, node.ID)
-
-		err := cn.performStreamRestore(node, dataBuffer, dataSize)
-		if err == nil {
-			logger.Info("Successfully restored data to %s on attempt %d", node.ID, attempt)
-			return nil
+	for totalSent < dataSize {
+		n, err := dataReader.Read(buffer)
+		if err != nil && err != io.EOF {
+			return fmt.Errorf("failed to read data: %v", err)
 		}
 
-		logger.Error("Attempt %d failed to restore to %s: %v", attempt, node.ID, err)
-
-		if attempt < maxRetries {
-			// 等待一段时间后重试
-			waitTime := time.Duration(attempt) * 2 * time.Second
-			logger.Info("Waiting %v before retry %d", waitTime, attempt+1)
-			time.Sleep(waitTime)
-		}
-	}
-
-	return fmt.Errorf("failed to restore after %d attempts", maxRetries)
-}
-
-// performStreamRestore 执行单次流式恢复尝试
-func (cn *CoordinatorNode) performStreamRestore(node *ServerNode, dataBuffer []byte, dataSize int64) error {
-	// 计算备份端口
-	portNum, err := strconv.Atoi(node.Port)
-	if err != nil {
-		return fmt.Errorf("invalid port number: %v", err)
-	}
-	backupPort := strconv.Itoa(portNum + 1000)
-
-	// 连接到备份端口
-	backupAddr := fmt.Sprintf("%s:%s", node.Address, backupPort)
-	logger.Info("Connecting to restore port: %s", backupAddr)
-
-	conn, err := net.DialTimeout("tcp", backupAddr, 15*time.Second)
-	if err != nil {
-		return fmt.Errorf("failed to connect to backup port: %v", err)
-	}
-	defer conn.Close()
-
-	// 设置TCP选项和连接超时
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		tcpConn.SetNoDelay(true)
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
-	}
-	conn.SetDeadline(time.Now().Add(15 * time.Minute))
-
-	// 发送RESTORE请求
-	logger.Info("Sending RESTORE request to %s", node.ID)
-	_, err = conn.Write([]byte("RESTORE\n"))
-	if err != nil {
-		return fmt.Errorf("failed to send restore request: %v", err)
-	}
-
-	// 发送数据大小
-	sizeMsg := fmt.Sprintf("%d\n", dataSize)
-	logger.Info("Sending data size %d to %s", dataSize, node.ID)
-	_, err = conn.Write([]byte(sizeMsg))
-	if err != nil {
-		return fmt.Errorf("failed to send data size: %v", err)
-	}
-
-	// 读取确认响应
-	logger.Info("Waiting for OK response from %s", node.ID)
-	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-
-	responseBuffer := make([]byte, 1024)
-	n, err := conn.Read(responseBuffer)
-	if err != nil {
-		return fmt.Errorf("failed to read restore response from %s: %v", node.ID, err)
-	}
-
-	response := strings.TrimSpace(string(responseBuffer[:n]))
-	logger.Info("Received response from %s: '%s'", node.ID, response)
-
-	if !strings.HasPrefix(response, "OK") {
-		return fmt.Errorf("restore request failed, server response: %s", response)
-	}
-
-	// 清除读取超时，准备发送数据流
-	conn.SetReadDeadline(time.Time{})
-	logger.Info("Starting chunked data stream to %s, sending %d bytes", node.ID, dataSize)
-
-	// 分块传输数据以提高稳定性
-	return cn.sendDataInChunks(conn, dataBuffer, node.ID)
-}
-
-// sendDataInChunks 分块发送数据
-func (cn *CoordinatorNode) sendDataInChunks(conn net.Conn, data []byte, nodeID string) error {
-	const chunkSize = 64 * 1024 // 64KB块
-	totalSize := len(data)
-	var totalSent int
-
-	for offset := 0; offset < totalSize; offset += chunkSize {
-		end := offset + chunkSize
-		if end > totalSize {
-			end = totalSize
+		if n == 0 {
+			break
 		}
 
-		chunk := data[offset:end]
-		chunkLen := len(chunk)
-
-		logger.Info("Sending chunk to %s: offset=%d, size=%d, total_progress=%.1f%%",
-			nodeID, offset, chunkLen, float64(offset)/float64(totalSize)*100)
-
-		// 设置写入超时
-		conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-
-		bytesSent, err := conn.Write(chunk)
-		if err != nil {
-			return fmt.Errorf("failed to send chunk at offset %d: %v", offset, err)
+		chunk := &serverpb.RestoreChunk{
+			Data:      buffer[:n],
+			TotalSize: dataSize,
+			IsLast:    totalSent+int64(n) >= dataSize,
 		}
 
-		if bytesSent != chunkLen {
-			return fmt.Errorf("incomplete chunk write: sent %d, expected %d", bytesSent, chunkLen)
+		if err := stream.Send(chunk); err != nil {
+			return fmt.Errorf("failed to send restore chunk: %v", err)
 		}
 
-		totalSent += bytesSent
+		totalSent += int64(n)
 
-		// 每发送一个块后稍微暂停，确保网络稳定
-		if chunkLen == chunkSize {
-			time.Sleep(10 * time.Millisecond)
+		// 报告进度，减少日志频率
+		if totalSent%(5*1024*1024) == 0 || totalSent >= dataSize {
+			progress := float64(totalSent) / float64(dataSize) * 100
+			logger.Info("Restore progress to %s: %.1f%% (%d/%d bytes)", node.ID, progress, totalSent, dataSize)
 		}
 	}
 
-	logger.Info("Completed chunked transfer to %s: sent %d bytes", nodeID, totalSent)
-
-	if totalSent != totalSize {
-		return fmt.Errorf("total bytes mismatch: sent %d, expected %d", totalSent, totalSize)
+	// 关闭流并获取响应
+	resp, err := stream.CloseAndRecv()
+	if err != nil {
+		return fmt.Errorf("failed to complete restore stream: %v", err)
 	}
 
+	if !resp.Success {
+		return fmt.Errorf("restore failed: %s", resp.Message)
+	}
+
+	logger.Info("gRPC stream restore to %s completed successfully", node.ID)
 	return nil
 }
 
@@ -1011,9 +736,17 @@ func (cn *CoordinatorNode) performDataCatchup(newNode *ServerNode) {
 		return
 	}
 
-	// 新节点注册时强制同步，不检查阈值
-	logger.Info("New node %s (LSN: %d) will sync from primary %s (LSN: %d)",
-		newNode.ID, newNode.LSN, primary.ID, primary.LSN)
+	// 检查新节点LSN是否小于主节点，只有小于才需要同步（使用读锁保护）
+	cn.mu.RLock()
+	newNodeLSN := newNode.LSN
+	primaryLSN := primary.LSN
+	cn.mu.RUnlock()
+
+	if newNodeLSN >= primaryLSN {
+		logger.Info("New node %s (LSN: %d) is already up-to-date with primary %s (LSN: %d), no sync needed",
+			newNode.ID, newNodeLSN, primary.ID, primaryLSN)
+		return
+	}
 
 	// 使用重试机制进行同步
 	go cn.performSyncWithRetry(newNode, primary)
@@ -1044,69 +777,104 @@ func (cn *CoordinatorNode) performStartupDataCatchup() {
 		return
 	}
 
+	// 使用读锁保护对primary LSN的访问
+	cn.mu.RLock()
+	primaryLSN := primary.LSN
+	cn.mu.RUnlock()
+
 	logger.Info("Startup sync check: Primary %s LSN=%d, %d replicas detected",
-		primary.ID, primary.LSN, replicaCount)
+		primary.ID, primaryLSN, replicaCount)
 
 	// 启动后的数据一致性检查会由独立的监控器线程处理
 	// 这里只记录状态，让定期检查来处理同步
 	logger.Info("Startup data catchup process completed - periodic monitor will handle ongoing sync")
 }
 
-// getSyncSkipReason 获取跳过同步的原因（用于日志）
+// getSyncSkipReason 获取跳过同步的原因（用于日志）（修复竞态条件）
 func (cn *CoordinatorNode) getSyncSkipReason(replica, primary *ServerNode) string {
-	lsnDiff := primary.LSN - replica.LSN
+	// 使用读锁保护对节点状态的访问
+	cn.mu.RLock()
+	replicaLSN := replica.LSN
+	primaryLSN := primary.LSN
+	replicaLastSyncTime := replica.LastSyncTime
+	replicaStatus := replica.Status
+	cn.mu.RUnlock()
 
-	if lsnDiff < lsnSyncThreshold {
-		return fmt.Sprintf("LSN diff %d below threshold %d", lsnDiff, lsnSyncThreshold)
+	lsnDiff := primaryLSN - replicaLSN
+	timeSinceLastSync := time.Since(replicaLastSyncTime)
+
+	if lsnDiff <= 0 {
+		return fmt.Sprintf("no LSN diff (diff=%d)", lsnDiff)
 	}
 
-	if time.Since(replica.LastSyncTime) < syncCooldown {
-		return fmt.Sprintf("in cooldown period (%v remaining)",
-			syncCooldown-time.Since(replica.LastSyncTime))
+	if timeSinceLastSync < syncInterval {
+		return fmt.Sprintf("within sync interval (%v remaining)", syncInterval-timeSinceLastSync)
 	}
 
-	if replica.Status == NodeStatusSyncing {
+	if timeSinceLastSync < syncCooldown {
+		return fmt.Sprintf("in cooldown period (%v remaining)", syncCooldown-timeSinceLastSync)
+	}
+
+	if replicaStatus == NodeStatusSyncing {
 		return "already syncing"
 	}
 
 	return "unknown reason"
 }
 
-// shouldTriggerSync 判断是否应该触发同步 - 改进版本
+// shouldTriggerSync 判断是否应该触发同步 - 定时同步策略（修复竞态条件）
 func (cn *CoordinatorNode) shouldTriggerSync(replica, primary *ServerNode, forceSync bool) bool {
 	// 强制同步（如新节点注册）
 	if forceSync {
 		return true
 	}
 
+	// 使用读锁保护对节点状态的访问
+	cn.mu.RLock()
+	replicaStatus := replica.Status
+	primaryStatus := primary.Status
+	replicaLSN := replica.LSN
+	primaryLSN := primary.LSN
+	replicaSyncRetryCount := replica.SyncRetryCount
+	replicaLastSyncTime := replica.LastSyncTime
+	cn.mu.RUnlock()
+
 	// 检查节点状态
-	if replica.Status != NodeStatusActive || primary.Status != NodeStatusActive {
+	if replicaStatus != NodeStatusActive || primaryStatus != NodeStatusActive {
 		return false
 	}
 
-	// 检查LSN差异是否超过阈值
-	lsnDiff := primary.LSN - replica.LSN
-	if lsnDiff < lsnSyncThreshold {
+	// 如果有LSN差异且距离上次同步已超过同步间隔，则触发同步
+	lsnDiff := primaryLSN - replicaLSN
+	timeSinceLastSync := time.Since(replicaLastSyncTime)
+
+	// 如果没有LSN差异，不需要同步
+	if lsnDiff <= 0 {
 		return false
 	}
 
 	// 检查是否在冷却期（只有重试耗尽后才会进入冷却期）
-	if replica.SyncRetryCount >= maxSyncRetries && time.Since(replica.LastSyncTime) < syncCooldown {
+	if replicaSyncRetryCount >= maxSyncRetries && timeSinceLastSync < syncCooldown {
 		logger.Info("Node %s is in sync cooldown period after %d failed retries, skipping (cooldown ends in %v)",
-			replica.ID, replica.SyncRetryCount, syncCooldown-time.Since(replica.LastSyncTime))
+			replica.ID, replicaSyncRetryCount, syncCooldown-timeSinceLastSync)
 		return false
 	}
 
-	// 如果重试次数耗尽且冷却期已过，重置重试计数
-	if replica.SyncRetryCount >= maxSyncRetries && time.Since(replica.LastSyncTime) >= syncCooldown {
+	// 如果重试次数耗尽且冷却期已过，重置重试计数（需要写锁）
+	if replicaSyncRetryCount >= maxSyncRetries && timeSinceLastSync >= syncCooldown {
 		logger.Info("Cooldown period ended for %s, resetting retry count", replica.ID)
+		cn.mu.Lock()
 		replica.SyncRetryCount = 0
+		cn.mu.Unlock()
 	}
 
-	logger.Info("Sync decision for %s: LSN diff=%d (threshold=%d), retry count=%d/%d",
-		replica.ID, lsnDiff, lsnSyncThreshold, replica.SyncRetryCount, maxSyncRetries)
+	// 基于时间间隔的同步策略：有LSN差异且距离上次同步超过syncInterval时间
+	shouldSync := timeSinceLastSync >= syncInterval
 
-	return true
+	logger.Info("Sync decision for %s: LSN diff=%d, time since last sync=%v (interval=%v), retry count=%d/%d, should sync=%v",
+		replica.ID, lsnDiff, timeSinceLastSync, syncInterval, replicaSyncRetryCount, maxSyncRetries, shouldSync)
+
+	return shouldSync
 }
 
 // performSyncWithRetry 执行带重试的同步
@@ -1122,16 +890,20 @@ func (cn *CoordinatorNode) performSyncWithRetry(replica, primary *ServerNode) {
 	replica.Status = NodeStatusSyncing
 	cn.mu.Unlock()
 
-	logger.Info("Starting sync for %s (attempt %d/%d)", replica.ID, replica.SyncRetryCount+1, maxSyncRetries)
+	// 使用读锁获取当前的重试计数来记录日志
+	cn.mu.RLock()
+	currentRetryCount := replica.SyncRetryCount
+	cn.mu.RUnlock()
+
+	logger.Info("Starting sync for %s (attempt %d/%d)", replica.ID, currentRetryCount+1, maxSyncRetries)
 
 	// 执行同步
 	err := cn.performStreamDataSync(primary, replica)
 
 	// 处理同步结果
-	cn.mu.Lock()
-	defer cn.mu.Unlock()
-
 	if err != nil {
+		// 同步失败，更新状态（需要锁保护）
+		cn.mu.Lock()
 		replica.SyncRetryCount++
 		logger.Error("Sync failed for %s (attempt %d/%d): %v",
 			replica.ID, replica.SyncRetryCount, maxSyncRetries, err)
@@ -1141,42 +913,54 @@ func (cn *CoordinatorNode) performSyncWithRetry(replica, primary *ServerNode) {
 			replica.LastSyncTime = time.Now() // 进入冷却期
 		}
 		replica.Status = NodeStatusActive // 恢复活跃状态
+		cn.mu.Unlock()
 	} else {
+		// 同步成功，更新状态（需要锁保护）
+		cn.mu.Lock()
 		logger.Info("Sync completed successfully for %s", replica.ID)
 		replica.Status = NodeStatusActive
 		replica.SyncRetryCount = 0 // 重置重试计数
 		replica.LastSyncTime = time.Now()
+		cn.mu.Unlock()
 
-		// 验证同步结果
+		// 验证同步结果（在锁外执行网络操作）
 		cn.verifySyncResult(replica, primary)
 	}
 }
 
-// verifySyncResult 验证同步结果
+// verifySyncResult 验证同步结果（修复竞态条件）
 func (cn *CoordinatorNode) verifySyncResult(replica, primary *ServerNode) {
-	// 让新节点自己计算当前LSN状态
-	logger.Info("Requesting current LSN from node %s after data sync", replica.ID)
-	lsnResponse, err := cn.sendCommandToNode(replica, "GET __lsn__")
+	// 使用gRPC获取节点的最新LSN
+	if replica.grpcClient == nil {
+		logger.Error("gRPC client not initialized for replica %s", replica.ID)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second) // 增加超时时间
+	defer cancel()
+
+	resp, err := replica.grpcClient.GetLSN(ctx, &serverpb.Empty{})
 	if err != nil {
 		logger.Error("Failed to get LSN from node %s: %v", replica.ID, err)
-	} else {
-		logger.Info("Node %s current LSN status: %s", replica.ID, lsnResponse)
-
-		// 尝试解析LSN值进行验证
-		if strings.Contains(lsnResponse, ":") {
-			parts := strings.Split(lsnResponse, ":")
-			if len(parts) >= 2 {
-				if newLSN, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64); err == nil {
-					lsnDiff := primary.LSN - newLSN
-					logger.Info("Sync result: %s LSN=%d, Primary LSN=%d, remaining diff=%d",
-						replica.ID, newLSN, primary.LSN, lsnDiff)
-
-					// 更新节点的LSN值
-					replica.LSN = newLSN
-				}
-			}
-		}
+		return
 	}
+
+	newLSN := resp.Lsn
+	logger.Info("Node %s current LSN after sync: %d", replica.ID, newLSN)
+
+	// 使用读锁获取primary的LSN
+	cn.mu.RLock()
+	primaryLSN := primary.LSN
+	cn.mu.RUnlock()
+
+	lsnDiff := primaryLSN - newLSN
+	logger.Info("Sync result: %s LSN=%d, Primary LSN=%d, remaining diff=%d",
+		replica.ID, newLSN, primaryLSN, lsnDiff)
+
+	// 使用写锁更新节点的LSN值
+	cn.mu.Lock()
+	replica.LSN = newLSN
+	cn.mu.Unlock()
 }
 
 // performStreamDataSync 执行流式数据同步
@@ -1240,11 +1024,213 @@ func (cn *CoordinatorNode) performPeriodicDataCatchup() {
 
 	for _, replica := range replicas {
 		if cn.shouldTriggerSync(replica, primary, false) {
+			// 使用读锁获取当前LSN值以记录日志
+			cn.mu.RLock()
+			lsnDiff := primary.LSN - replica.LSN
+			cn.mu.RUnlock()
+
 			logger.Info("Triggering periodic sync for %s (LSN diff: %d)",
-				replica.ID, primary.LSN-replica.LSN)
+				replica.ID, lsnDiff)
 			go cn.performSyncWithRetry(replica, primary)
 		}
 	}
+}
+
+// RegisterServer 实现gRPC RegisterServer方法
+func (cn *CoordinatorNode) RegisterServer(ctx context.Context, req *pb.RegisterRequest) (*pb.RegisterResponse, error) {
+	logger.Info("Received gRPC registration request from %s:%s (ID: %s, LSN: %d)", req.Address, req.Port, req.NodeId, req.Lsn)
+
+	// 计算gRPC端口（假设server的gRPC端口是主端口+100）
+	portNum, err := strconv.Atoi(req.Port)
+	if err != nil {
+		return &pb.RegisterResponse{
+			Success: false,
+			Message: "Invalid port number",
+		}, nil
+	}
+	grpcPort := strconv.Itoa(portNum + 100)
+	cn.mu.Lock()
+	// 注意：不使用defer，因为我们需要在方法中间释放锁
+
+	// 检查是否为重复注册
+	existingNode, exists := cn.serverNodes[req.NodeId]
+	if exists {
+		logger.Info("Node %s re-registering, updating existing node info (LSN: %d -> %d)", req.NodeId, existingNode.LSN, req.Lsn)
+
+		// 更新现有节点的信息
+		existingNode.Address = req.Address
+		existingNode.Port = req.Port
+		existingNode.GRPCPort = grpcPort
+		existingNode.LSN = req.Lsn
+		existingNode.LastSeen = time.Now()
+		existingNode.Status = NodeStatusActive
+
+		// 检查是否需要重新建立gRPC连接
+		serverAddr := fmt.Sprintf("%s:%s", req.Address, grpcPort)
+		if existingNode.grpcConn == nil {
+			logger.Info("Re-establishing gRPC connection for node %s", req.NodeId)
+			grpcConn, err := grpc.Dial(serverAddr,
+				grpc.WithTransportCredentials(insecure.NewCredentials()),
+				grpc.WithKeepaliveParams(keepalive.ClientParameters{
+					Time:                30 * time.Second,
+					Timeout:             10 * time.Second,
+					PermitWithoutStream: true,
+				}),
+			)
+			if err != nil {
+				logger.Error("Failed to re-establish gRPC connection for %s: %v", req.NodeId, err)
+				cn.mu.Unlock() // 错误处理，释放锁
+				return &pb.RegisterResponse{
+					Success: false,
+					Message: fmt.Sprintf("Failed to re-establish gRPC connection: %v", err),
+				}, nil
+			}
+			existingNode.grpcConn = grpcConn
+			existingNode.grpcClient = serverpb.NewDatabaseServiceClient(grpcConn)
+		}
+
+		cn.mu.Unlock() // 重复注册处理完成，释放锁
+		return &pb.RegisterResponse{
+			Success: true,
+			Role:    existingNode.Role.String(),
+			Message: "Re-registration successful",
+		}, nil
+	}
+
+	// 新节点注册 - 创建到服务器的gRPC连接
+	logger.Info("New node %s registering with address %s and port %s", req.NodeId, req.Address, grpcPort)
+	serverAddr := fmt.Sprintf("%s:%s", req.Address, grpcPort)
+	grpcConn, err := grpc.Dial(serverAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                30 * time.Second, // 与服务器端保持一致
+			Timeout:             10 * time.Second,
+			PermitWithoutStream: true,
+		}),
+	)
+	if err != nil {
+		logger.Error("Failed to connect to server %s via gRPC: %v", req.NodeId, err)
+		cn.mu.Unlock() // 错误处理，释放锁
+		return &pb.RegisterResponse{
+			Success: false,
+			Message: fmt.Sprintf("Failed to establish gRPC connection: %v", err),
+		}, nil
+	}
+
+	// 创建服务器节点
+	node := &ServerNode{
+		ID:         req.NodeId,
+		Address:    req.Address,
+		Port:       req.Port,
+		GRPCPort:   grpcPort,
+		Role:       NodeRoleReplica, // 默认为从节点
+		Status:     NodeStatusActive,
+		LSN:        req.Lsn, // 使用节点注册时的LSN
+		LastSeen:   time.Now(),
+		grpcConn:   grpcConn,
+		grpcClient: serverpb.NewDatabaseServiceClient(grpcConn),
+	}
+
+	cn.serverNodes[req.NodeId] = node
+	nodeCount := len(cn.serverNodes)
+	wasStarted := cn.started
+	// 释放锁，避免死锁
+	cn.mu.Unlock()
+
+	logger.Info("Server %s registered successfully with LSN %d. Total nodes: %d", req.NodeId, req.Lsn, nodeCount)
+
+	// 检查是否可以启动系统
+	if !wasStarted && nodeCount >= minNodes {
+		// 在锁外调用 startSystem()
+		go func() {
+			cn.startSystem()
+
+			// 系统刚刚启动，检查所有副本节点是否需要同步
+			cn.mu.RLock()
+			primary := cn.primaryNode
+			var replicasNeedingSync []*ServerNode
+
+			if primary != nil {
+				for _, serverNode := range cn.serverNodes {
+					if serverNode.Role == NodeRoleReplica && serverNode.LSN < primary.LSN {
+						replicasNeedingSync = append(replicasNeedingSync, serverNode)
+					}
+				}
+			}
+			cn.mu.RUnlock()
+
+			// 对所有需要同步的副本节点启动数据同步
+			for _, replica := range replicasNeedingSync {
+				logger.Info("System startup: initiating sync for replica %s (LSN: %d) from primary %s (LSN: %d)",
+					replica.ID, replica.LSN, primary.ID, primary.LSN)
+				go cn.performDataCatchup(replica)
+			}
+
+			if len(replicasNeedingSync) > 0 {
+				logger.Info("System startup: initiated sync for %d replica nodes", len(replicasNeedingSync))
+			} else {
+				logger.Info("System startup: all replica nodes are up-to-date")
+			}
+		}()
+	} else {
+		// 打印当前注册的节点
+		logger.Info("Current registered nodes: %v", cn.serverNodes)
+
+		// 系统已经运行，检查当前注册的节点是否需要同步
+		cn.mu.RLock()
+		needsCatchup := cn.started && cn.primaryNode != nil && node.LSN < cn.primaryNode.LSN
+		cn.mu.RUnlock()
+
+		// 如果系统已启动且新节点LSN小于主节点，启动数据同步
+		if needsCatchup {
+			go cn.performDataCatchup(node)
+		}
+	}
+
+	// 由于我们手动释放了锁，这里不需要defer unlock
+	return &pb.RegisterResponse{
+		Success: true,
+		Role:    node.Role.String(),
+		Message: "Registration successful",
+	}, nil
+}
+
+// Heartbeat 实现gRPC Heartbeat方法
+func (cn *CoordinatorNode) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
+	// 更新节点的最后心跳时间和LSN
+	cn.mu.Lock()
+	if node, exists := cn.serverNodes[req.NodeId]; exists {
+		oldStatus := node.Status
+		node.LastSeen = time.Now()
+		node.LSN = req.Lsn
+		// 如果节点之前是DOWN状态，重新标记为ACTIVE
+		if node.Status == NodeStatusDown {
+			logger.Info("Node %s is back online", req.NodeId)
+			node.Status = NodeStatusActive
+		}
+		// 只在状态变化时记录日志
+		if oldStatus != node.Status {
+			logger.Info("Node %s status changed from %s to %s", req.NodeId, oldStatus.String(), node.Status.String())
+		}
+	}
+	cn.mu.Unlock()
+
+	return &pb.HeartbeatResponse{
+		Success:   true,
+		Timestamp: time.Now().Unix(),
+	}, nil
+}
+
+// StreamBackup 实现gRPC StreamBackup方法（CN作为客户端从server拉取数据）
+func (cn *CoordinatorNode) StreamBackup(req *pb.BackupRequest, stream pb.CoordinatorService_StreamBackupServer) error {
+	// 这个方法在当前架构中不需要，因为CN是从server拉取数据，而不是server推送到CN
+	return fmt.Errorf("not implemented: CN pulls data from servers, not the other way")
+}
+
+// StreamRestore 实现gRPC StreamRestore方法（CN作为客户端推送数据到server）
+func (cn *CoordinatorNode) StreamRestore(stream pb.CoordinatorService_StreamRestoreServer) error {
+	// 这个方法在当前架构中不需要，因为CN是主动推送数据到server，而不是server从CN拉取
+	return fmt.Errorf("not implemented: CN pushes data to servers, not pulled by servers")
 }
 
 func main() {
@@ -1254,6 +1240,7 @@ func main() {
 	defer logger.Close()
 
 	port := flag.String("port", defaultPort, "Port for client connections")
+	grpcPort := flag.String("grpc-port", defaultGRPCPort, "Port for gRPC connections")
 	help := flag.Bool("help", false, "Show help message")
 	flag.Parse()
 
@@ -1265,7 +1252,7 @@ func main() {
 		return
 	}
 
-	cn := NewCoordinatorNode(*port)
+	cn := NewCoordinatorNode(*port, *grpcPort)
 	if err := cn.Start(); err != nil {
 		logger.Error("Failed to start coordinator: %v", err)
 		os.Exit(1)

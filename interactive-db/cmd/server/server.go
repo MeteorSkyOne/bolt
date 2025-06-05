@@ -3,8 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -15,11 +15,17 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"interactive-db/pkg/logger"
+	cnpb "interactive-db/proto/coordinator"
+	pb "interactive-db/proto/server"
 
 	"github.com/meteorsky/bolt"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 )
 
 const (
@@ -28,8 +34,10 @@ const (
 	bucketName        = "kv_store"
 	lsnKey            = "__LSN__"        // LSN存储的特殊键
 	defaultCNAddress  = "localhost:9091" // CN注册端口
-	heartbeatInterval = 3 * time.Second
-	backupPortOffset  = 1000 // 备份端口偏移量
+	heartbeatInterval = 10 * time.Second // 调整为10秒，与CN保持一致
+	heartbeatTimeout  = 20 * time.Second // 相应调整超时时间
+	grpcPortOffset    = 100              // gRPC端口偏移量
+	backupPortOffset  = 1000             // 备份端口偏移量
 )
 
 // NodeRole 节点角色
@@ -83,15 +91,29 @@ type ClientSession struct {
 
 // DatabaseServer 数据库服务器
 type DatabaseServer struct {
+	pb.UnimplementedDatabaseServiceServer
 	db         *bolt.DB
+	dbMu       sync.RWMutex // 保护数据库字段的并发访问
 	clients    map[string]*ClientSession
 	clientMu   sync.RWMutex
 	port       string
-	backupPort string
+	grpcPort   string // gRPC服务端口
 	nodeID     string
 	cnAddress  string
+	cnClient   cnpb.CoordinatorServiceClient // CN客户端
+	cnConn     *grpc.ClientConn              // CN gRPC连接
 	role       NodeRole
 	registered bool
+	grpcServer *grpc.Server
+	backupPort string
+	// 新增字段用于连接管理
+	connMu       sync.RWMutex
+	connHealthy  bool
+	lastConnTime time.Time
+	atomicLSN    int64 // 原子LSN变量
+	// 新增字段用于优雅关闭
+	shutdownCh chan struct{}
+	activeOps  sync.WaitGroup // 跟踪活跃的数据库操作
 }
 
 // NewDatabaseServer 创建新的数据库服务器
@@ -119,16 +141,52 @@ func NewDatabaseServer(dbFile, nodeID, cnAddress string) (*DatabaseServer, error
 		cnAddress:  cnAddress,
 		role:       NodeRoleReplica, // 默认从节点
 		registered: false,
+		grpcServer: grpc.NewServer(),
+		shutdownCh: make(chan struct{}),
 	}
 
 	// 初始化LSN，如果不存在则设为0
 	server.initializeLSN()
+
+	// 如果指定了CN地址，建立gRPC连接
+	if cnAddress != "" {
+		conn, err := grpc.Dial(cnAddress,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithKeepaliveParams(keepalive.ClientParameters{
+				Time:                30 * time.Second, // 增加发送keepalive ping的时间间隔，与服务器端匹配
+				Timeout:             10 * time.Second, // 增加等待keepalive ping应答的超时时间
+				PermitWithoutStream: true,             // 允许在没有活跃流时发送keepalive ping
+			}),
+		)
+		if err != nil {
+			logger.Error("Failed to connect to coordinator: %v", err)
+			// 不返回错误，允许在没有CN的情况下运行
+		} else {
+			server.cnClient = cnpb.NewCoordinatorServiceClient(conn)
+			server.cnConn = conn
+			server.connHealthy = true
+			server.lastConnTime = time.Now()
+			logger.Info("Connected to coordinator at %s", cnAddress)
+		}
+	}
+
+	// 注册gRPC服务
+	pb.RegisterDatabaseServiceServer(server.grpcServer, server)
 
 	return server, nil
 }
 
 // Close 关闭服务器
 func (ds *DatabaseServer) Close() error {
+	// 发送关闭信号
+	close(ds.shutdownCh)
+
+	// 等待所有活跃操作完成
+	ds.activeOps.Wait()
+
+	ds.dbMu.Lock()
+	defer ds.dbMu.Unlock()
+
 	if ds.db != nil {
 		return ds.db.Close()
 	}
@@ -137,124 +195,126 @@ func (ds *DatabaseServer) Close() error {
 
 // initializeLSN 初始化LSN
 func (ds *DatabaseServer) initializeLSN() {
+	var currentLSN int64 = 0
+
 	err := ds.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(bucketName))
 		data := b.Get([]byte(lsnKey))
 		if data == nil {
 			// LSN不存在，初始化为0
-			return b.Put([]byte(lsnKey), []byte("0"))
+			if err := b.Put([]byte(lsnKey), []byte("0")); err != nil {
+				return err
+			}
+			currentLSN = 0
+		} else {
+			// LSN存在，解析现有值
+			if lsn, err := strconv.ParseInt(string(data), 10, 64); err == nil {
+				currentLSN = lsn
+			}
 		}
 		return nil
 	})
+
 	if err != nil {
 		logger.Error("Failed to initialize LSN: %v", err)
+	} else {
+		// 设置原子变量
+		atomic.StoreInt64(&ds.atomicLSN, currentLSN)
+		logger.Info("LSN initialized to: %d", currentLSN)
 	}
 }
 
 // incrementLSN 递增LSN
 func (ds *DatabaseServer) incrementLSN() {
-	err := ds.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(bucketName))
-		data := b.Get([]byte(lsnKey))
-		currentLSN := int64(0)
-		if data != nil {
-			if lsn, err := strconv.ParseInt(string(data), 10, 64); err == nil {
-				currentLSN = lsn
-			}
+	// 原子递增LSN
+	newLSN := atomic.AddInt64(&ds.atomicLSN, 1)
+
+	// 异步更新数据库中的LSN值
+	go func() {
+		err := ds.db.Update(func(tx *bolt.Tx) error {
+			b := tx.Bucket([]byte(bucketName))
+			return b.Put([]byte(lsnKey), []byte(strconv.FormatInt(newLSN, 10)))
+		})
+		if err != nil {
+			logger.Error("Failed to persist LSN %d: %v", newLSN, err)
 		}
-		currentLSN++
-		return b.Put([]byte(lsnKey), []byte(strconv.FormatInt(currentLSN, 10)))
-	})
-	if err != nil {
-		logger.Error("Failed to increment LSN: %v", err)
-	}
+	}()
 }
 
 // getLSN 获取当前LSN
 func (ds *DatabaseServer) getLSN() int64 {
-	var lsn int64 = 0
-	err := ds.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(bucketName))
-		data := b.Get([]byte(lsnKey))
-		if data != nil {
-			if parsedLSN, err := strconv.ParseInt(string(data), 10, 64); err == nil {
-				lsn = parsedLSN
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		logger.Error("Failed to get LSN: %v", err)
+	return atomic.LoadInt64(&ds.atomicLSN)
+}
+
+// safeDbOperation 安全执行数据库操作，避免与恢复操作冲突
+func (ds *DatabaseServer) safeDbOperation(operation func() error) error {
+	// 检查是否正在关闭
+	select {
+	case <-ds.shutdownCh:
+		return fmt.Errorf("server is shutting down")
+	default:
 	}
-	return lsn
+
+	// 增加活跃操作计数
+	ds.activeOps.Add(1)
+	defer ds.activeOps.Done()
+
+	// 获取读锁，允许多个数据库操作并发，但阻止恢复操作
+	ds.dbMu.RLock()
+	defer ds.dbMu.RUnlock()
+
+	// 再次检查是否正在关闭
+	select {
+	case <-ds.shutdownCh:
+		return fmt.Errorf("server is shutting down")
+	default:
+	}
+
+	return operation()
 }
 
 // registerToCN 注册到协调节点
 func (ds *DatabaseServer) registerToCN(port string) error {
-	if ds.cnAddress == "" {
-		return fmt.Errorf("coordinator address not specified")
+	if ds.cnClient == nil {
+		return fmt.Errorf("coordinator client not initialized")
 	}
 
-	logger.Info("Attempting to register to coordinator at %s", ds.cnAddress)
-	conn, err := net.Dial("tcp", ds.cnAddress)
-	if err != nil {
-		return fmt.Errorf("failed to connect to coordinator: %v", err)
-	}
-	defer conn.Close()
+	logger.Info("Attempting to register to coordinator via gRPC")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
 	// 发送注册请求
-	req := RegisterRequest{
-		NodeID:  ds.nodeID,
+	req := &cnpb.RegisterRequest{
+		NodeId:  ds.nodeID,
 		Address: "localhost", // 可以从配置获取
 		Port:    port,
+		Lsn:     ds.getLSN(), // 添加当前LSN用于选举决策
 	}
 
 	logger.Info("Sending registration request: %+v", req)
-	encoder := json.NewEncoder(conn)
-	if err := encoder.Encode(req); err != nil {
-		return fmt.Errorf("failed to send registration request: %v", err)
+	resp, err := ds.cnClient.RegisterServer(ctx, req)
+	if err != nil {
+		return fmt.Errorf("failed to register to coordinator: %v", err)
 	}
 
-	logger.Info("Registration request sent, waiting for response...")
-	// 读取响应
-	decoder := json.NewDecoder(conn)
-	var response map[string]interface{}
-	if err := decoder.Decode(&response); err != nil {
-		// 尝试读取原始响应内容
-		conn.Close()
-		conn, err = net.Dial("tcp", ds.cnAddress)
-		if err != nil {
-			return fmt.Errorf("failed to reconnect to coordinator: %v", err)
-		}
-		// 重新发送请求
-		encoder = json.NewEncoder(conn)
-		if err := encoder.Encode(req); err != nil {
-			return fmt.Errorf("failed to resend registration request: %v", err)
-		}
-		// 读取原始响应查看内容
-		buf := make([]byte, 1024)
-		n, _ := conn.Read(buf)
-		logger.Info("Raw response received: %s", string(buf[:n]))
-		return fmt.Errorf("failed to decode registration response: %v", err)
-	}
-
-	logger.Info("Registration response received: %+v", response)
-	if status, ok := response["status"].(string); ok && status == "success" {
+	logger.Info("Registration response received: %+v", resp)
+	if resp.Success {
 		ds.registered = true
 		ds.port = port // 保存端口信息
 		logger.Info("Successfully registered to coordinator as %s", ds.nodeID)
-		if role, ok := response["role"].(string); ok {
-			logger.Info("Assigned role: %s", role)
+		if resp.Role != "" {
+			logger.Info("Assigned role: %s", resp.Role)
 		}
 		return nil
 	}
 
-	return fmt.Errorf("registration failed: %v", response)
+	return fmt.Errorf("registration failed: %s", resp.Message)
 }
 
 // startHeartbeat 启动心跳
 func (ds *DatabaseServer) startHeartbeat() {
-	if !ds.registered {
+	if !ds.registered || ds.cnClient == nil {
 		return
 	}
 
@@ -268,34 +328,71 @@ func (ds *DatabaseServer) startHeartbeat() {
 	}()
 }
 
+// startLSNMonitor 启动LSN监控，定期打印当前LSN
+func (ds *DatabaseServer) startLSNMonitor() {
+	go func() {
+		ticker := time.NewTicker(3 * time.Second) // 每30秒打印一次LSN
+		defer ticker.Stop()
+
+		for range ticker.C {
+			currentLSN := ds.getLSN()
+			logger.Info("Current LSN: %d", currentLSN)
+		}
+	}()
+}
+
 // sendHeartbeat 发送心跳
 func (ds *DatabaseServer) sendHeartbeat() {
-	if ds.cnAddress == "" {
+	if ds.cnClient == nil {
 		return
 	}
 
-	// 连接到CN的心跳端口
-	heartbeatAddr := strings.Replace(ds.cnAddress, "9091", "9092", 1) // 心跳端口
-	conn, err := net.Dial("tcp", heartbeatAddr)
-	if err != nil {
-		logger.Error("Failed to connect to coordinator for heartbeat: %v", err)
-		return
+	// 检查连接健康状态
+	if !ds.checkConnectionHealth() {
+		logger.Info("Connection unhealthy, attempting to reconnect...")
+		if err := ds.reconnectToCN(); err != nil {
+			logger.Error("Failed to reconnect to coordinator: %v", err)
+			return
+		}
+		// 重新注册
+		if err := ds.registerToCN(ds.port); err != nil {
+			logger.Error("Failed to re-register after reconnection: %v", err)
+			return
+		}
 	}
-	defer conn.Close()
+
+	// 使用更短的初始超时时间
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
 	// 发送心跳请求
-	heartbeat := HeartbeatRequest{
-		NodeID: ds.nodeID,
-		LSN:    ds.getLSN(),
+	req := &cnpb.HeartbeatRequest{
+		NodeId: ds.nodeID,
+		Lsn:    ds.getLSN(),
 	}
 
-	encoder := json.NewEncoder(conn)
-	if err := encoder.Encode(heartbeat); err != nil {
+	resp, err := ds.cnClient.Heartbeat(ctx, req)
+	if err != nil {
+		// 只记录错误，不立即重试，让下一个心跳周期处理
 		logger.Error("Failed to send heartbeat: %v", err)
+
+		// 如果是 context deadline exceeded 错误，标记连接为不健康
+		if strings.Contains(err.Error(), "context deadline exceeded") ||
+			strings.Contains(err.Error(), "connection refused") {
+			logger.Info("LOCK: Acquiring connMu.Lock() for marking connection unhealthy in heartbeat")
+			ds.connMu.Lock()
+			logger.Info("LOCK: Acquired connMu.Lock() for marking connection unhealthy in heartbeat")
+			ds.connHealthy = false
+			logger.Info("UNLOCK: Releasing connMu.Unlock() after marking connection unhealthy in heartbeat")
+			ds.connMu.Unlock()
+			logger.Info("UNLOCK: Released connMu.Unlock() after marking connection unhealthy in heartbeat")
+		}
 		return
 	}
 
-	logger.Info("Heartbeat sent (LSN: %d)", ds.getLSN())
+	if !resp.Success {
+		logger.Error("Heartbeat rejected by coordinator")
+	}
 }
 
 // Start 启动服务器
@@ -303,24 +400,35 @@ func (ds *DatabaseServer) Start(port string) error {
 	ds.port = port
 	serverAddr := ":" + port
 
-	// 计算备份端口
+	// 计算gRPC端口
 	portNum, err := strconv.Atoi(port)
 	if err != nil {
 		return fmt.Errorf("invalid port number: %v", err)
 	}
-	ds.backupPort = strconv.Itoa(portNum + backupPortOffset)
+	ds.grpcPort = strconv.Itoa(portNum + grpcPortOffset)
 
+	// 启动gRPC服务器
+	grpcListener, err := net.Listen("tcp", ":"+ds.grpcPort)
+	if err != nil {
+		return fmt.Errorf("failed to start gRPC server: %v", err)
+	}
+
+	go func() {
+		logger.Info("gRPC server started on port %s", ds.grpcPort)
+		if err := ds.grpcServer.Serve(grpcListener); err != nil {
+			logger.Error("gRPC server error: %v", err)
+		}
+	}()
+
+	// 启动TCP服务器（用于客户端连接）
 	listener, err := net.Listen("tcp", serverAddr)
 	if err != nil {
 		return fmt.Errorf("failed to start server: %v", err)
 	}
 	defer listener.Close()
 
-	// 启动备份服务器
-	go ds.startBackupServer()
-
 	logger.Info("Database server started on port %s", port)
-	logger.Info("Backup server started on port %s", ds.backupPort)
+	logger.Info("gRPC service available on port %s", ds.grpcPort)
 	logger.Info("Waiting for clients...")
 
 	for {
@@ -347,372 +455,6 @@ func (ds *DatabaseServer) Start(port string) error {
 		logger.Info("Client %s connected from %s", clientID, conn.RemoteAddr())
 		go ds.handleClient(session)
 	}
-}
-
-// startBackupServer 启动备份服务器
-func (ds *DatabaseServer) startBackupServer() {
-	backupAddr := ":" + ds.backupPort
-	listener, err := net.Listen("tcp", backupAddr)
-	if err != nil {
-		logger.Error("Failed to start backup server: %v", err)
-		return
-	}
-	defer listener.Close()
-
-	logger.Info("Backup server listening on port %s", ds.backupPort)
-
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			logger.Error("Failed to accept backup connection: %v", err)
-			continue
-		}
-
-		go ds.handleBackupConnection(conn)
-	}
-}
-
-// handleBackupConnection 处理备份服务连接
-func (ds *DatabaseServer) handleBackupConnection(conn net.Conn) {
-	defer func() {
-		// 确保连接在函数退出时关闭
-		if err := conn.Close(); err != nil {
-			logger.Error("Failed to close backup connection: %v", err)
-		}
-	}()
-
-	// 设置连接超时
-	conn.SetDeadline(time.Now().Add(10 * time.Minute))
-
-	// 读取请求类型
-	scanner := bufio.NewScanner(conn)
-	if !scanner.Scan() {
-		logger.Error("Failed to read backup request")
-		return
-	}
-
-	request := strings.TrimSpace(scanner.Text())
-	logger.Info("Backup request: %s", request)
-
-	switch request {
-	case "BACKUP":
-		ds.handleStreamBackup(conn)
-	case "RESTORE":
-		ds.handleStreamRestore(conn)
-	default:
-		logger.Error("Unknown backup request: %s", request)
-		conn.Write([]byte("ERROR Unknown request\n"))
-	}
-}
-
-// handleStreamBackup 处理流式备份
-func (ds *DatabaseServer) handleStreamBackup(conn net.Conn) {
-	logger.Info("Starting stream backup")
-
-	// 先将数据写入临时buffer以获取大小
-	var buffer bytes.Buffer
-	err := ds.db.View(func(tx *bolt.Tx) error {
-		_, err := tx.WriteTo(&buffer)
-		return err
-	})
-
-	if err != nil {
-		logger.Error("Failed to create backup: %v", err)
-		conn.Write([]byte("ERROR Failed to create backup\n"))
-		return
-	}
-
-	dataSize := buffer.Len()
-	logger.Info("Backup data size: %d bytes", dataSize)
-
-	// 发送成功响应和数据大小
-	response := fmt.Sprintf("OK %d\n", dataSize)
-	_, err = conn.Write([]byte(response))
-	if err != nil {
-		logger.Error("Failed to send response: %v", err)
-		return
-	}
-
-	// 确保响应被发送
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		tcpConn.SetNoDelay(true)
-	}
-
-	// 发送实际数据
-	bytesWritten, err := io.Copy(conn, &buffer)
-	if err != nil {
-		logger.Error("Failed to stream backup data: %v", err)
-		return
-	}
-
-	if bytesWritten != int64(dataSize) {
-		logger.Error("Incomplete data transmission: wrote %d bytes, expected %d bytes", bytesWritten, dataSize)
-		return
-	}
-
-	// 确保所有数据都被发送
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		tcpConn.CloseWrite() // 关闭写端，但保持读端开放以接收确认
-	}
-
-	logger.Info("Stream backup completed successfully, sent %d bytes", bytesWritten)
-
-	// 等待客户端确认接收完成（可选）
-	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	ackBuffer := make([]byte, 10)
-	_, err = conn.Read(ackBuffer)
-	if err != nil && err != io.EOF {
-		logger.Info("No acknowledgment received from client (this is normal): %v", err)
-	}
-}
-
-// handleStreamRestore 处理流式恢复 - 增强版本
-func (ds *DatabaseServer) handleStreamRestore(conn net.Conn) {
-	logger.Info("Starting stream restore")
-
-	// 读取数据大小
-	scanner := bufio.NewScanner(conn)
-	if !scanner.Scan() {
-		logger.Error("Failed to read data size")
-		conn.Write([]byte("ERROR Failed to read data size\n"))
-		return
-	}
-
-	sizeStr := strings.TrimSpace(scanner.Text())
-	expectedSize, err := strconv.ParseInt(sizeStr, 10, 64)
-	if err != nil {
-		logger.Error("Invalid data size: %s", sizeStr)
-		conn.Write([]byte("ERROR Invalid data size\n"))
-		return
-	}
-
-	logger.Info("Expecting %d bytes for restore", expectedSize)
-
-	// 发送确认响应并确保立即发送
-	_, err = conn.Write([]byte("OK\n"))
-	if err != nil {
-		logger.Error("Failed to send OK response: %v", err)
-		return
-	}
-
-	// 确保响应被立即发送
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		tcpConn.SetNoDelay(true)
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
-	}
-
-	logger.Info("Sent OK response for restore, waiting for data stream")
-
-	// 创建临时文件
-	tempFile := ds.db.Path() + ".temp"
-	file, err := os.Create(tempFile)
-	if err != nil {
-		logger.Error("Failed to create temp file: %v", err)
-		return
-	}
-
-	// 使用分块接收以提高稳定性
-	bytesReceived, err := ds.receiveDataInChunks(conn, file, expectedSize)
-	file.Close()
-
-	if err != nil {
-		logger.Error("Failed to receive backup data: %v", err)
-		os.Remove(tempFile)
-		return
-	}
-
-	if bytesReceived != expectedSize {
-		logger.Error("Received %d bytes, expected %d bytes", bytesReceived, expectedSize)
-		os.Remove(tempFile)
-		return
-	}
-
-	logger.Info("Received exactly %d bytes for restore", bytesReceived)
-
-	// 验证接收到的数据库文件是否有效
-	if err := ds.validateDatabaseFile(tempFile); err != nil {
-		logger.Error("Invalid database file received: %v", err)
-		os.Remove(tempFile)
-		return
-	}
-
-	logger.Info("Database file validation passed")
-
-	// 保存原始路径
-	originalPath := ds.db.Path()
-	backupPath := originalPath + ".backup"
-
-	// 创建当前数据库的备份
-	if err := ds.createBackupFile(originalPath, backupPath); err != nil {
-		logger.Error("Failed to create backup of current database: %v", err)
-		os.Remove(tempFile)
-		return
-	}
-
-	// 关闭当前数据库
-	if err := ds.db.Close(); err != nil {
-		logger.Error("Failed to close current database: %v", err)
-		os.Remove(tempFile)
-		return
-	}
-
-	// 替换数据库文件
-	if err := os.Rename(tempFile, originalPath); err != nil {
-		logger.Error("Failed to replace database file: %v", err)
-		// 尝试恢复原始数据库
-		ds.recoverFromBackup(originalPath, backupPath)
-		os.Remove(tempFile)
-		return
-	}
-
-	// 重新打开数据库
-	db, err := bolt.Open(originalPath, 0600, &bolt.Options{Timeout: 10 * time.Second})
-	if err != nil {
-		logger.Error("Failed to reopen database: %v", err)
-		// 尝试恢复原始数据库
-		ds.recoverFromBackup(originalPath, backupPath)
-		return
-	}
-
-	ds.db = db
-
-	// 确保bucket存在并验证数据完整性
-	err = ds.db.Update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists([]byte(bucketName))
-		return err
-	})
-
-	if err != nil {
-		logger.Error("Failed to create bucket after restore: %v", err)
-		ds.db.Close()
-		ds.recoverFromBackup(originalPath, backupPath)
-		return
-	}
-
-	// 删除备份文件（成功恢复后）
-	os.Remove(backupPath)
-	logger.Info("Stream restore completed successfully")
-}
-
-// receiveDataInChunks 分块接收数据
-func (ds *DatabaseServer) receiveDataInChunks(conn net.Conn, file *os.File, expectedSize int64) (int64, error) {
-	const bufferSize = 64 * 1024 // 64KB缓冲区
-	var totalReceived int64
-	buffer := make([]byte, bufferSize)
-
-	// 设置读取超时
-	conn.SetReadDeadline(time.Now().Add(15 * time.Minute))
-
-	for totalReceived < expectedSize {
-		remaining := expectedSize - totalReceived
-		readSize := bufferSize
-		if remaining < int64(bufferSize) {
-			readSize = int(remaining)
-		}
-
-		// 设置每次读取的超时
-		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-
-		bytesRead, err := conn.Read(buffer[:readSize])
-		if err != nil {
-			if err == io.EOF && totalReceived == expectedSize {
-				break
-			}
-			return totalReceived, fmt.Errorf("failed to read chunk at offset %d: %v", totalReceived, err)
-		}
-
-		if bytesRead == 0 {
-			if totalReceived == expectedSize {
-				break
-			}
-			return totalReceived, fmt.Errorf("unexpected end of stream at offset %d", totalReceived)
-		}
-
-		// 写入文件
-		bytesWritten, err := file.Write(buffer[:bytesRead])
-		if err != nil {
-			return totalReceived, fmt.Errorf("failed to write to temp file: %v", err)
-		}
-
-		if bytesWritten != bytesRead {
-			return totalReceived, fmt.Errorf("incomplete write: wrote %d, read %d", bytesWritten, bytesRead)
-		}
-
-		totalReceived += int64(bytesRead)
-
-		// 每接收一定数据后报告进度
-		if totalReceived%1048576 == 0 || totalReceived == expectedSize { // 每1MB或完成时
-			progress := float64(totalReceived) / float64(expectedSize) * 100
-			logger.Info("Restore progress: %.1f%% (%d/%d bytes)", progress, totalReceived, expectedSize)
-		}
-	}
-
-	logger.Info("Data reception completed: %d bytes received", totalReceived)
-	return totalReceived, nil
-}
-
-// validateDatabaseFile 验证数据库文件是否有效
-func (ds *DatabaseServer) validateDatabaseFile(filePath string) error {
-	// 尝试打开数据库文件进行验证
-	db, err := bolt.Open(filePath, 0600, &bolt.Options{
-		Timeout:  5 * time.Second,
-		ReadOnly: true,
-	})
-	if err != nil {
-		return fmt.Errorf("cannot open database file: %v", err)
-	}
-	defer db.Close()
-
-	// 验证数据库结构
-	err = db.View(func(tx *bolt.Tx) error {
-		// 检查是否可以正常读取数据库
-		return nil
-	})
-
-	if err != nil {
-		return fmt.Errorf("database structure validation failed: %v", err)
-	}
-
-	return nil
-}
-
-// createBackupFile 创建当前数据库的备份
-func (ds *DatabaseServer) createBackupFile(originalPath, backupPath string) error {
-	return ds.db.View(func(tx *bolt.Tx) error {
-		file, err := os.Create(backupPath)
-		if err != nil {
-			return err
-		}
-		defer file.Close()
-
-		_, err = tx.WriteTo(file)
-		return err
-	})
-}
-
-// recoverFromBackup 从备份恢复数据库
-func (ds *DatabaseServer) recoverFromBackup(originalPath, backupPath string) {
-	logger.Info("Attempting to recover from backup")
-
-	// 删除损坏的文件
-	os.Remove(originalPath)
-
-	// 恢复备份
-	if err := os.Rename(backupPath, originalPath); err != nil {
-		logger.Error("Failed to recover from backup: %v", err)
-		return
-	}
-
-	// 重新打开原始数据库
-	db, err := bolt.Open(originalPath, 0600, nil)
-	if err != nil {
-		logger.Error("Failed to reopen original database: %v", err)
-		return
-	}
-
-	ds.db = db
-	logger.Info("Successfully recovered from backup")
 }
 
 // handleClient 处理客户端连接
@@ -1265,28 +1007,63 @@ func (ds *DatabaseServer) restoreDatabase(session *ClientSession, backupData str
 		return fmt.Sprintf("Error writing temporary backup file: %v", err)
 	}
 
-	// 关闭当前数据库
+	// 保存原始路径
 	originalPath := ds.db.Path()
-	if err := ds.db.Close(); err != nil {
-		os.Remove(tempFile)
-		return fmt.Sprintf("Error closing current database: %v", err)
-	}
 
-	// 替换数据库文件
-	if err := os.Rename(tempFile, originalPath); err != nil {
-		// 重新打开原数据库
-		ds.db, _ = bolt.Open(originalPath, 0600, nil)
+	// 暂停心跳发送，避免在数据库恢复期间出现锁竞争
+	logger.Info("Suspending heartbeat during database restore")
+	ds.connMu.Lock()
+	ds.connHealthy = false // 暂时标记为不健康，避免发送心跳
+	ds.connMu.Unlock()
+
+	// 确保无论成功还是失败都恢复心跳
+	defer func() {
+		ds.connMu.Lock()
+		ds.connHealthy = true
+		ds.connMu.Unlock()
+	}()
+
+	// 获取写锁来保护数据库替换操作
+	logger.Info("LOCK: Acquiring dbMu.Lock() for database replacement operation")
+	ds.dbMu.Lock()
+	logger.Info("LOCK: Acquired dbMu.Lock() for database replacement operation")
+	defer func() {
+		logger.Info("UNLOCK: Releasing dbMu.Unlock() after database replacement operation (defer)")
+		ds.dbMu.Unlock()
+		logger.Info("UNLOCK: Released dbMu.Unlock() after database replacement operation (defer)")
+	}()
+
+	// 关闭当前数据库
+	logger.Info("Closing current database")
+	if err := ds.db.ForceClose(); err != nil {
+		logger.Error("Failed to close current database: %v", err)
 		os.Remove(tempFile)
-		return fmt.Sprintf("Error replacing database file: %v", err)
+		return fmt.Sprintf("failed to close database: %v", err)
 	}
+	logger.Info("Current database closed successfully")
+
+	// 直接替换数据库文件
+	logger.Info("Replacing database file")
+	if err := os.Rename(tempFile, originalPath); err != nil {
+		logger.Error("Failed to replace database file: %v", err)
+		os.Remove(tempFile)
+		return fmt.Sprintf("failed to replace database: %v", err)
+	}
+	logger.Info("Database file replaced successfully")
 
 	// 重新打开数据库
-	db, err := bolt.Open(originalPath, 0600, nil)
+	logger.Info("Reopening database")
+	db, err := bolt.Open(originalPath, 0600, &bolt.Options{Timeout: 10 * time.Second})
 	if err != nil {
-		return fmt.Sprintf("Error reopening database: %v", err)
+		logger.Error("Failed to reopen database: %v", err)
+		os.Remove(originalPath) // 删除损坏的文件
+		return fmt.Sprintf("failed to reopen database: %v", err)
 	}
+	logger.Info("Database reopened successfully")
 
 	ds.db = db
+	// 重新初始化LSN以同步原子变量与恢复的数据库
+	ds.initializeLSN()
 
 	// 确保bucket存在
 	err = ds.db.Update(func(tx *bolt.Tx) error {
@@ -1295,10 +1072,314 @@ func (ds *DatabaseServer) restoreDatabase(session *ClientSession, backupData str
 	})
 
 	if err != nil {
-		return fmt.Sprintf("Error creating bucket: %v", err)
+		logger.Error("Failed to create bucket after restore: %v", err)
+		return fmt.Sprintf("failed to create bucket: %v", err)
+	}
+	logger.Info("Bucket created successfully")
+
+	logger.Info("gRPC stream restore completed successfully")
+	return "RESTORE -> database restored successfully"
+}
+
+// ExecuteCommand 实现gRPC ExecuteCommand方法
+func (ds *DatabaseServer) ExecuteCommand(ctx context.Context, req *pb.CommandRequest) (*pb.CommandResponse, error) {
+	// 创建临时会话来执行命令
+	session := &ClientSession{
+		ID:             fmt.Sprintf("grpc_%d", time.Now().UnixNano()),
+		conn:           nil,
+		inTransaction:  false,
+		boltTx:         nil,
+		transactionOps: make([]TransactionOperation, 0),
 	}
 
-	return "RESTORE -> database restored successfully"
+	result := ds.executeCommand(session, req.Command)
+
+	return &pb.CommandResponse{
+		Result:  result,
+		Success: !strings.HasPrefix(result, "Error:"),
+	}, nil
+}
+
+// GetLSN 实现gRPC GetLSN方法
+func (ds *DatabaseServer) GetLSN(ctx context.Context, _ *pb.Empty) (*pb.LSNResponse, error) {
+	return &pb.LSNResponse{
+		Lsn: ds.getLSN(),
+	}, nil
+}
+
+// StreamBackup 实现gRPC StreamBackup方法
+func (ds *DatabaseServer) StreamBackup(req *pb.BackupRequest, stream pb.DatabaseService_StreamBackupServer) error {
+	logger.Info("Starting gRPC stream backup")
+
+	// 将数据写入临时buffer以获取大小
+	var buffer bytes.Buffer
+	err := ds.db.View(func(tx *bolt.Tx) error {
+		_, err := tx.WriteTo(&buffer)
+		return err
+	})
+
+	if err != nil {
+		logger.Error("Failed to create backup: %v", err)
+		return fmt.Errorf("failed to create backup: %v", err)
+	}
+
+	data := buffer.Bytes()
+	totalSize := int64(len(data))
+	chunkSize := 64 * 1024 // 64KB chunks
+
+	logger.Info("Backup data size: %d bytes", totalSize)
+
+	// 分块发送数据
+	for offset := 0; offset < len(data); offset += chunkSize {
+		end := offset + chunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+
+		chunk := &pb.BackupChunk{
+			Data:      data[offset:end],
+			TotalSize: totalSize,
+			IsLast:    end == len(data),
+		}
+
+		if err := stream.Send(chunk); err != nil {
+			logger.Error("Failed to send backup chunk: %v", err)
+			return err
+		}
+
+		logger.Info("Sent backup chunk: offset=%d, size=%d", offset, end-offset)
+	}
+
+	logger.Info("gRPC stream backup completed successfully")
+	return nil
+}
+
+// StreamRestore 实现gRPC StreamRestore方法
+func (ds *DatabaseServer) StreamRestore(stream pb.DatabaseService_StreamRestoreServer) error {
+	logger.Info("Starting gRPC stream restore")
+
+	var buffer bytes.Buffer
+	var totalSize int64
+	var bytesReceived int64
+
+	// 接收所有数据块
+	for {
+		chunk, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			logger.Error("Failed to receive restore chunk: %v", err)
+			return err
+		}
+
+		// 第一个块包含总大小信息
+		if totalSize == 0 {
+			totalSize = chunk.TotalSize
+			logger.Info("Expected restore data size: %d bytes", totalSize)
+		}
+
+		buffer.Write(chunk.Data)
+		bytesReceived += int64(len(chunk.Data))
+
+		if chunk.IsLast {
+			logger.Info("Received last chunk, total bytes: %d", bytesReceived)
+			break
+		}
+	}
+
+	if bytesReceived != totalSize {
+		err := fmt.Errorf("size mismatch: received %d bytes, expected %d bytes", bytesReceived, totalSize)
+		return stream.SendAndClose(&pb.RestoreResponse{
+			Success: false,
+			Message: err.Error(),
+		})
+	}
+
+	// 创建临时文件
+	tempFile := ds.db.Path() + ".temp"
+	if err := ioutil.WriteFile(tempFile, buffer.Bytes(), 0644); err != nil {
+		logger.Error("Failed to write temp file: %v", err)
+		return stream.SendAndClose(&pb.RestoreResponse{
+			Success: false,
+			Message: fmt.Sprintf("failed to write temp file: %v", err),
+		})
+	}
+
+	// 验证数据库文件
+	if err := ds.validateDatabaseFile(tempFile); err != nil {
+		logger.Error("Invalid database file received: %v", err)
+		os.Remove(tempFile)
+		return stream.SendAndClose(&pb.RestoreResponse{
+			Success: false,
+			Message: fmt.Sprintf("invalid database file: %v", err),
+		})
+	}
+
+	// 保存原始路径
+	originalPath := ds.db.Path()
+
+	// 暂停心跳发送，避免在数据库恢复期间出现锁竞争
+	logger.Info("Suspending heartbeat during database restore")
+	ds.connMu.Lock()
+	ds.connHealthy = false // 暂时标记为不健康，避免发送心跳
+	ds.connMu.Unlock()
+
+	// 确保无论成功还是失败都恢复心跳
+	defer func() {
+		ds.connMu.Lock()
+		ds.connHealthy = true
+		ds.connMu.Unlock()
+	}()
+
+	// 获取写锁来保护数据库替换操作
+	logger.Info("LOCK: Acquiring dbMu.Lock() for database replacement operation")
+	ds.dbMu.Lock()
+	logger.Info("LOCK: Acquired dbMu.Lock() for database replacement operation")
+	defer func() {
+		logger.Info("UNLOCK: Releasing dbMu.Unlock() after database replacement operation (defer)")
+		ds.dbMu.Unlock()
+		logger.Info("UNLOCK: Released dbMu.Unlock() after database replacement operation (defer)")
+	}()
+
+	// 关闭当前数据库
+	logger.Info("Closing current database")
+	if err := ds.db.Close(); err != nil {
+		logger.Error("Failed to close current database: %v", err)
+		os.Remove(tempFile)
+		return stream.SendAndClose(&pb.RestoreResponse{
+			Success: false,
+			Message: fmt.Sprintf("failed to close database: %v", err),
+		})
+	}
+	logger.Info("Current database closed successfully")
+
+	// 直接替换数据库文件
+	logger.Info("Replacing database file")
+	if err := os.Rename(tempFile, originalPath); err != nil {
+		logger.Error("Failed to replace database file: %v", err)
+		os.Remove(tempFile)
+		return stream.SendAndClose(&pb.RestoreResponse{
+			Success: false,
+			Message: fmt.Sprintf("failed to replace database: %v", err),
+		})
+	}
+	logger.Info("Database file replaced successfully")
+
+	// 重新打开数据库
+	logger.Info("Reopening database")
+	db, err := bolt.Open(originalPath, 0600, &bolt.Options{Timeout: 10 * time.Second})
+	if err != nil {
+		logger.Error("Failed to reopen database: %v", err)
+		os.Remove(originalPath) // 删除损坏的文件
+		return stream.SendAndClose(&pb.RestoreResponse{
+			Success: false,
+			Message: fmt.Sprintf("failed to reopen database: %v", err),
+		})
+	}
+	logger.Info("Database reopened successfully")
+
+	ds.db = db
+	// 重新初始化LSN以同步原子变量与恢复的数据库
+	ds.initializeLSN()
+
+	// 确保bucket存在
+	err = ds.db.Update(func(tx *bolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists([]byte(bucketName))
+		return err
+	})
+
+	if err != nil {
+		logger.Error("Failed to create bucket after restore: %v", err)
+		return stream.SendAndClose(&pb.RestoreResponse{
+			Success: false,
+			Message: fmt.Sprintf("failed to create bucket: %v", err),
+		})
+	}
+	logger.Info("Bucket created successfully")
+
+	logger.Info("gRPC stream restore completed successfully")
+	return stream.SendAndClose(&pb.RestoreResponse{
+		Success: true,
+		Message: "restore completed successfully",
+	})
+}
+
+// validateDatabaseFile 验证数据库文件是否有效
+func (ds *DatabaseServer) validateDatabaseFile(filePath string) error {
+	// 尝试打开数据库文件进行验证
+	db, err := bolt.Open(filePath, 0600, &bolt.Options{
+		Timeout:  5 * time.Second,
+		ReadOnly: true,
+	})
+	if err != nil {
+		return fmt.Errorf("cannot open database file: %v", err)
+	}
+	defer db.Close()
+
+	// 验证数据库结构
+	err = db.View(func(tx *bolt.Tx) error {
+		// 检查是否可以正常读取数据库
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("database structure validation failed: %v", err)
+	}
+
+	return nil
+}
+
+// checkConnectionHealth 检查连接健康状态
+func (ds *DatabaseServer) checkConnectionHealth() bool {
+	ds.connMu.RLock()
+	healthy := ds.connHealthy
+	ds.connMu.RUnlock()
+	return healthy
+}
+
+// reconnectToCN 重连到协调节点
+func (ds *DatabaseServer) reconnectToCN() error {
+	if ds.cnAddress == "" {
+		return fmt.Errorf("no coordinator address specified")
+	}
+
+	logger.Info("Attempting to reconnect to coordinator at %s", ds.cnAddress)
+
+	// 关闭旧连接
+	ds.connMu.Lock()
+	if ds.cnConn != nil {
+		ds.cnConn.Close()
+	}
+	ds.connHealthy = false
+	ds.connMu.Unlock()
+
+	// 建立新连接
+	conn, err := grpc.Dial(ds.cnAddress,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                30 * time.Second, // 增加发送keepalive ping的时间间隔，与服务器端匹配
+			Timeout:             10 * time.Second, // 增加等待keepalive ping应答的超时时间
+			PermitWithoutStream: true,             // 允许在没有活跃流时发送keepalive ping
+		}),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to reconnect to coordinator: %v", err)
+	}
+
+	logger.Info("LOCK: Acquiring connMu.Lock() for setting new connection in reconnect")
+	ds.connMu.Lock()
+	logger.Info("LOCK: Acquired connMu.Lock() for setting new connection in reconnect")
+	ds.cnClient = cnpb.NewCoordinatorServiceClient(conn)
+	ds.cnConn = conn
+	ds.connHealthy = true
+	ds.lastConnTime = time.Now()
+	logger.Info("UNLOCK: Releasing connMu.Unlock() after setting new connection in reconnect")
+	ds.connMu.Unlock()
+	logger.Info("UNLOCK: Released connMu.Unlock() after setting new connection in reconnect")
+
+	logger.Info("Successfully reconnected to coordinator")
+	return nil
 }
 
 func main() {
@@ -1363,6 +1444,9 @@ func main() {
 			server.startHeartbeat()
 		}
 	}
+
+	// 启动LSN监控
+	server.startLSNMonitor()
 
 	// 启动服务器
 	if err := server.Start(*port); err != nil {

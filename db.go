@@ -386,6 +386,10 @@ func (db *DB) init() error {
 	return nil
 }
 
+func (db *DB) ForceClose() error {
+	return db.close()
+}
+
 // Close releases all database resources.
 // All transactions must be closed before closing the database.
 func (db *DB) Close() error {
