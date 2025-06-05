@@ -771,6 +771,15 @@ func (dc *DatabaseClient) executeCommand(command string) {
 	}
 
 	// 写入输出文件
+	// 确保输出文件的目录存在
+	outputDir := filepath.Dir(outputFile)
+	if outputDir != "." && outputDir != "" {
+		if err := os.MkdirAll(outputDir, 0755); err != nil {
+			fmt.Printf("Error creating output directory: %v\n", err)
+			return
+		}
+	}
+
 	if err := os.WriteFile(outputFile, []byte(allOutput.String()), 0644); err != nil {
 		fmt.Printf("Error writing to output file: %v\n", err)
 	} else {

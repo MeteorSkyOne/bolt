@@ -1,28 +1,34 @@
 #!/bin/bash
 
 echo "========================================"
-echo "多进程事务正确性测试"
+echo "多进程事务正确性测试 - 分布式模式"
 echo "========================================"
 
 # 查找可用端口的函数
 find_available_port() {
-    local port=8080
+    local start_port=$1
+    local port=$start_port
     while true; do
         if ! lsof -i :$port >/dev/null 2>&1; then
             echo $port
             return
         fi
         port=$((port + 1))
-        if [ $port -gt 9000 ]; then
-            echo "ERROR: No available port found in range 8080-9000" >&2
+        if [ $port -gt $((start_port + 1000)) ]; then
+            echo "ERROR: No available port found in range $start_port-$((start_port + 1000))" >&2
             exit 1
         fi
     done
 }
 
-# 查找可用端口
-AVAILABLE_PORT=$(find_available_port)
-echo "Using port: $AVAILABLE_PORT"
+# 查找CN和服务器端口
+CN_PORT=$(find_available_port 9090)
+SERVER_PORT1=$(find_available_port 8080)
+SERVER_PORT2=$(find_available_port 8081)
+SERVER_PORT3=$(find_available_port 8082)
+
+echo "Using CN port: $CN_PORT"
+echo "Using server ports: $SERVER_PORT1, $SERVER_PORT2, $SERVER_PORT3"
 
 # 测试结果目录
 TEST_OUTPUT_DIR="test_results"
@@ -30,35 +36,70 @@ mkdir -p $TEST_OUTPUT_DIR
 
 # 清理之前的测试结果
 rm -f $TEST_OUTPUT_DIR/*
-rm -f interactive.db
+rm -f interactive.db node1.db node2.db node3.db
 
-# 停止可能运行的服务器
+# 停止可能运行的进程
+pkill -f "cmd/coordinator" 2>/dev/null || true
 pkill -f "cmd/server" 2>/dev/null || true
+pkill -f "bin/coordinator" 2>/dev/null || true
 pkill -f "bin/server" 2>/dev/null || true
 sleep 2
 
 # 编译程序
-echo "编译程序..."
-go build -o bin/server ./cmd/server
-go build -o bin/client ./cmd/client
+echo "编译分布式组件..."
+make build-cn build-server build-client
 
 if [ $? -ne 0 ]; then
     echo "编译失败"
     exit 1
 fi
 
-# 启动服务器
-echo "启动服务器..."
-./bin/server --port $AVAILABLE_PORT &
-SERVER_PID=$!
+# 启动CN节点
+echo "启动CN节点..."
+./bin/cn -port $CN_PORT &
+CN_PID=$!
 sleep 3
 
-if ! kill -0 $SERVER_PID 2>/dev/null; then
-    echo "服务器启动失败"
+if ! kill -0 $CN_PID 2>/dev/null; then
+    echo "CN节点启动失败"
     exit 1
 fi
 
-echo "服务器启动成功，PID: $SERVER_PID"
+# 启动3个服务器节点
+echo "启动服务器节点..."
+./bin/server -port $SERVER_PORT1 -id node1 -cn "127.0.0.1:9091" -db node1.db &
+SERVER1_PID=$!
+
+./bin/server -port $SERVER_PORT2 -id node2 -cn "127.0.0.1:9091" -db node2.db &
+SERVER2_PID=$!
+
+./bin/server -port $SERVER_PORT3 -id node3 -cn "127.0.0.1:9091" -db node3.db &
+SERVER3_PID=$!
+
+sleep 5
+
+# 检查所有节点是否成功启动
+failed=false
+if ! kill -0 $SERVER1_PID 2>/dev/null; then
+    echo "服务器节点1启动失败"
+    failed=true
+fi
+if ! kill -0 $SERVER2_PID 2>/dev/null; then
+    echo "服务器节点2启动失败"
+    failed=true
+fi
+if ! kill -0 $SERVER3_PID 2>/dev/null; then
+    echo "服务器节点3启动失败"
+    failed=true
+fi
+
+if [ "$failed" = true ]; then
+    echo "停止所有进程..."
+    kill $CN_PID $SERVER1_PID $SERVER2_PID $SERVER3_PID 2>/dev/null
+    exit 1
+fi
+
+echo "分布式集群启动成功！"
 
 # 测试结果变量
 TEST1_RESULT="FAIL"
@@ -71,12 +112,12 @@ echo "测试1：银行转账事务一致性"
 echo "========================"
 
 # 初始化账户
-./bin/client --port $AVAILABLE_PORT --command "PUT account_A 1000" > /dev/null
-./bin/client --port $AVAILABLE_PORT --command "PUT account_B 1000" > /dev/null
-./bin/client --port $AVAILABLE_PORT --command "PUT total_transactions 0" > /dev/null
+./bin/client -host localhost -port $CN_PORT -command "PUT account_A 1000" > /dev/null
+./bin/client -host localhost -port $CN_PORT -command "PUT account_B 1000" > /dev/null
+./bin/client -host localhost -port $CN_PORT -command "PUT total_transactions 0" > /dev/null
 
 echo "初始状态："
-./bin/client --port $AVAILABLE_PORT --command "SHOW"
+./bin/client -host localhost -port $CN_PORT -command "SHOW"
 
 # 创建转账测试文件（添加延迟以减少并发冲突）
 cat > $TEST_OUTPUT_DIR/transfer_client1.txt << 'EOF'
@@ -108,21 +149,21 @@ EOF
 
 # 顺序执行转账操作以确保事务计数准确
 echo "执行转账操作（顺序执行避免计数冲突）..."
-./bin/client --port $AVAILABLE_PORT --batch $TEST_OUTPUT_DIR/transfer_client1.txt > $TEST_OUTPUT_DIR/result1.log 2>&1
+./bin/client -host localhost -port $CN_PORT -batch $TEST_OUTPUT_DIR/transfer_client1.txt > $TEST_OUTPUT_DIR/result1.log 2>&1
 sleep 0.5
-./bin/client --port $AVAILABLE_PORT --batch $TEST_OUTPUT_DIR/transfer_client2.txt > $TEST_OUTPUT_DIR/result2.log 2>&1
+./bin/client -host localhost -port $CN_PORT -batch $TEST_OUTPUT_DIR/transfer_client2.txt > $TEST_OUTPUT_DIR/result2.log 2>&1
 sleep 0.5
-./bin/client --port $AVAILABLE_PORT --batch $TEST_OUTPUT_DIR/transfer_client3.txt > $TEST_OUTPUT_DIR/result3.log 2>&1
+./bin/client -host localhost -port $CN_PORT -batch $TEST_OUTPUT_DIR/transfer_client3.txt > $TEST_OUTPUT_DIR/result3.log 2>&1
 
 echo "转账操作完成，检查结果..."
 
 # 获取最终结果
-FINAL_A=$(./bin/client --port $AVAILABLE_PORT --command "GET account_A" | xargs)
-FINAL_B=$(./bin/client --port $AVAILABLE_PORT --command "GET account_B" | xargs)
-TOTAL_TX=$(./bin/client --port $AVAILABLE_PORT --command "GET total_transactions" | xargs)
+FINAL_A=$(./bin/client -host localhost -port $CN_PORT -command "GET account_A" | xargs)
+FINAL_B=$(./bin/client -host localhost -port $CN_PORT -command "GET account_B" | xargs)
+TOTAL_TX=$(./bin/client -host localhost -port $CN_PORT -command "GET total_transactions" | xargs)
 
 echo "最终状态："
-./bin/client --port $AVAILABLE_PORT --command "SHOW"
+./bin/client -host localhost -port $CN_PORT -command "SHOW"
 
 # 验证结果
 EXPECTED_TOTAL=$((1000 + 1000))  # 总金额应该保持不变
@@ -157,7 +198,7 @@ echo "测试2：计数器并发更新"
 echo "==================="
 
 # 重置计数器
-./bin/client --port $AVAILABLE_PORT --command "PUT counter 0" > /dev/null
+./bin/client -host localhost -port $CN_PORT -command "PUT counter 0" > /dev/null
 
 # 创建计数器更新测试文件
 for i in {1..5}; do
@@ -172,19 +213,19 @@ done
 echo "并发更新计数器（使用交错延迟）..."
 
 # 并发执行计数器更新，但有小延迟避免完全同时执行
-./bin/client --port $AVAILABLE_PORT --batch $TEST_OUTPUT_DIR/counter_client1.txt > $TEST_OUTPUT_DIR/counter_result1.log 2>&1 &
+./bin/client -host localhost -port $CN_PORT -batch $TEST_OUTPUT_DIR/counter_client1.txt > $TEST_OUTPUT_DIR/counter_result1.log 2>&1 &
 COUNTER_PID1=$!
 sleep 0.1
-./bin/client --port $AVAILABLE_PORT --batch $TEST_OUTPUT_DIR/counter_client2.txt > $TEST_OUTPUT_DIR/counter_result2.log 2>&1 &
+./bin/client -host localhost -port $CN_PORT -batch $TEST_OUTPUT_DIR/counter_client2.txt > $TEST_OUTPUT_DIR/counter_result2.log 2>&1 &
 COUNTER_PID2=$!
 sleep 0.1
-./bin/client --port $AVAILABLE_PORT --batch $TEST_OUTPUT_DIR/counter_client3.txt > $TEST_OUTPUT_DIR/counter_result3.log 2>&1 &
+./bin/client -host localhost -port $CN_PORT -batch $TEST_OUTPUT_DIR/counter_client3.txt > $TEST_OUTPUT_DIR/counter_result3.log 2>&1 &
 COUNTER_PID3=$!
 sleep 0.1
-./bin/client --port $AVAILABLE_PORT --batch $TEST_OUTPUT_DIR/counter_client4.txt > $TEST_OUTPUT_DIR/counter_result4.log 2>&1 &
+./bin/client -host localhost -port $CN_PORT -batch $TEST_OUTPUT_DIR/counter_client4.txt > $TEST_OUTPUT_DIR/counter_result4.log 2>&1 &
 COUNTER_PID4=$!
 sleep 0.1
-./bin/client --port $AVAILABLE_PORT --batch $TEST_OUTPUT_DIR/counter_client5.txt > $TEST_OUTPUT_DIR/counter_result5.log 2>&1 &
+./bin/client -host localhost -port $CN_PORT -batch $TEST_OUTPUT_DIR/counter_client5.txt > $TEST_OUTPUT_DIR/counter_result5.log 2>&1 &
 COUNTER_PID5=$!
 
 # 等待所有更新完成
@@ -195,7 +236,7 @@ wait $COUNTER_PID4
 wait $COUNTER_PID5
 
 # 检查计数器最终值
-FINAL_COUNTER=$(./bin/client --port $AVAILABLE_PORT --command "GET counter" | xargs)
+FINAL_COUNTER=$(./bin/client -host localhost -port $CN_PORT -command "GET counter" | xargs)
 
 echo "计数器最终值: $FINAL_COUNTER"
 echo "期望值: 5"
@@ -215,7 +256,7 @@ echo "测试3：事务隔离性"
 echo "================"
 
 # 初始化数据
-./bin/client --port $AVAILABLE_PORT --command "PUT isolation_test 100" > /dev/null
+./bin/client -host localhost -port $CN_PORT -command "PUT isolation_test 100" > /dev/null
 
 # 创建长事务测试文件
 cat > $TEST_OUTPUT_DIR/long_transaction.txt << 'EOF'
@@ -236,12 +277,12 @@ EOF
 echo "测试事务隔离性..."
 
 # 启动长事务（后台）
-./bin/client --port $AVAILABLE_PORT --batch $TEST_OUTPUT_DIR/long_transaction.txt > $TEST_OUTPUT_DIR/long_tx_result.log 2>&1 &
+./bin/client -host localhost -port $CN_PORT -batch $TEST_OUTPUT_DIR/long_transaction.txt > $TEST_OUTPUT_DIR/long_tx_result.log 2>&1 &
 LONG_TX_PID=$!
 
 # 稍等一下，然后进行并发读取
 sleep 1
-./bin/client --port $AVAILABLE_PORT --batch $TEST_OUTPUT_DIR/concurrent_read.txt > $TEST_OUTPUT_DIR/concurrent_read_result.log 2>&1
+./bin/client -host localhost -port $CN_PORT -batch $TEST_OUTPUT_DIR/concurrent_read.txt > $TEST_OUTPUT_DIR/concurrent_read_result.log 2>&1
 
 # 等待长事务完成
 wait $LONG_TX_PID
@@ -259,13 +300,13 @@ echo ""
 echo "测试文件:"
 ls -la $TEST_OUTPUT_DIR/
 
-# 关闭服务器
+# 关闭所有节点
 echo ""
-echo "关闭服务器..."
-kill $SERVER_PID 2>/dev/null
-wait $SERVER_PID 2>/dev/null
+echo "关闭分布式集群..."
+kill $CN_PID $SERVER1_PID $SERVER2_PID $SERVER3_PID 2>/dev/null
+wait $CN_PID $SERVER1_PID $SERVER2_PID $SERVER3_PID 2>/dev/null
 
-echo "多进程事务正确性测试完成！"
+echo "多进程事务正确性测试完成！(分布式模式)"
 
 # 打印测试结果总结
 echo ""
