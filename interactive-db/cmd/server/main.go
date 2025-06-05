@@ -44,12 +44,12 @@ type TransactionOperation struct {
 
 // ClientSession 客户端会话
 type ClientSession struct {
-	ID               string
-	conn             net.Conn
-	inTransaction    bool
-	transactionOps   []TransactionOperation
-	transactionCache map[string]string
-	mu               sync.RWMutex
+	ID             string
+	conn           net.Conn
+	inTransaction  bool
+	boltTx         *bolt.Tx // 直接使用BoltDB事务提供隔离
+	transactionOps []TransactionOperation
+	mu             sync.RWMutex
 }
 
 // DatabaseServer 数据库服务器
@@ -116,11 +116,11 @@ func (ds *DatabaseServer) Start(port string) error {
 		// 为每个客户端创建会话并启动goroutine处理
 		clientID := fmt.Sprintf("client_%d", time.Now().UnixNano())
 		session := &ClientSession{
-			ID:               clientID,
-			conn:             conn,
-			inTransaction:    false,
-			transactionOps:   make([]TransactionOperation, 0),
-			transactionCache: make(map[string]string),
+			ID:             clientID,
+			conn:           conn,
+			inTransaction:  false,
+			boltTx:         nil,
+			transactionOps: make([]TransactionOperation, 0),
 		}
 
 		ds.clientMu.Lock()
@@ -243,9 +243,16 @@ func (ds *DatabaseServer) beginTransaction(session *ClientSession) string {
 	if session.inTransaction {
 		return "Error: Already in transaction"
 	}
+
+	// 使用BoltDB原生事务隔离 - 开始只读事务获得一致性快照
+	tx, err := ds.db.Begin(false)
+	if err != nil {
+		return fmt.Sprintf("Error starting transaction: %v", err)
+	}
+
 	session.inTransaction = true
+	session.boltTx = tx
 	session.transactionOps = make([]TransactionOperation, 0)
-	session.transactionCache = make(map[string]string)
 	return "BEGIN -> transaction started"
 }
 
@@ -253,6 +260,11 @@ func (ds *DatabaseServer) beginTransaction(session *ClientSession) string {
 func (ds *DatabaseServer) commitTransaction(session *ClientSession) string {
 	if !session.inTransaction {
 		return "Error: No active transaction"
+	}
+
+	// 首先关闭只读事务
+	if err := session.boltTx.Rollback(); err != nil {
+		return fmt.Sprintf("Error closing read transaction: %v", err)
 	}
 
 	// 执行所有缓存的操作
@@ -280,8 +292,8 @@ func (ds *DatabaseServer) commitTransaction(session *ClientSession) string {
 
 	// 清理事务状态
 	session.inTransaction = false
+	session.boltTx = nil
 	session.transactionOps = make([]TransactionOperation, 0)
-	session.transactionCache = make(map[string]string)
 	return "COMMIT -> transaction committed"
 }
 
@@ -291,23 +303,31 @@ func (ds *DatabaseServer) abortTransaction(session *ClientSession) string {
 		return "Error: No active transaction"
 	}
 
+	// 关闭只读事务
+	if err := session.boltTx.Rollback(); err != nil {
+		logErrorWithTimestamp("Error rolling back transaction for client %s: %v", session.ID, err)
+	}
+
 	// 清理事务状态，不执行任何操作
 	session.inTransaction = false
+	session.boltTx = nil
 	session.transactionOps = make([]TransactionOperation, 0)
-	session.transactionCache = make(map[string]string)
 	return "ABORT -> transaction aborted"
 }
 
-// getValueFromCacheOrDB 从缓存或数据库获取值
+// getValueFromCacheOrDB 从缓存或数据库获取值（使用BoltDB原生事务隔离）
 func (ds *DatabaseServer) getValueFromCacheOrDB(session *ClientSession, key string) (string, bool) {
-	// 如果在事务中，先检查缓存
 	if session.inTransaction {
-		if value, exists := session.transactionCache[key]; exists {
-			return value, true
+		// 使用同一个BoltDB事务确保一致性读取
+		b := session.boltTx.Bucket([]byte(bucketName))
+		data := b.Get([]byte(key))
+		if data != nil {
+			return string(data), true
 		}
+		return "", false
 	}
 
-	// 从数据库获取
+	// 非事务模式，直接从数据库获取最新值
 	var value string
 	var found bool
 	err := ds.db.View(func(tx *bolt.Tx) error {
@@ -375,13 +395,12 @@ func (ds *DatabaseServer) put(session *ClientSession, key, value string) string 
 	}
 
 	if session.inTransaction {
-		// 在事务中，添加到操作列表和缓存
+		// 在事务中，添加到操作列表
 		session.transactionOps = append(session.transactionOps, TransactionOperation{
 			Type:  "PUT",
 			Key:   key,
 			Value: finalValue,
 		})
-		session.transactionCache[key] = finalValue
 		return fmt.Sprintf("PUT %s %s -> staged in transaction", key, value)
 	} else {
 		// 立即执行
@@ -411,13 +430,17 @@ func (ds *DatabaseServer) get(session *ClientSession, key string) string {
 // delete 删除键值对
 func (ds *DatabaseServer) delete(session *ClientSession, key string) string {
 	if session.inTransaction {
+		// 检查key是否存在于事务视图中
+		_, exists := ds.getValueFromCacheOrDB(session, key)
+		if !exists {
+			return fmt.Sprintf("DEL %s -> Key not found", key)
+		}
+
 		// 在事务中，添加到操作列表
 		session.transactionOps = append(session.transactionOps, TransactionOperation{
 			Type: "DEL",
 			Key:  key,
 		})
-		// 从缓存中删除（标记为已删除）
-		delete(session.transactionCache, key)
 		return fmt.Sprintf("DEL %s -> staged in transaction", key)
 	} else {
 		// 立即执行
