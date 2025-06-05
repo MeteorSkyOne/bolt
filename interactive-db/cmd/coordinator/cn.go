@@ -9,7 +9,6 @@ import (
 	pb "interactive-db/proto/coordinator"
 	serverpb "interactive-db/proto/server"
 	"io"
-	"math/rand"
 	"net"
 	"os"
 	"strconv"
@@ -92,9 +91,6 @@ type ServerNode struct {
 	conn           net.Conn                       // 到该节点的连接（TCP，用于客户端请求转发）
 	grpcConn       *grpc.ClientConn               // gRPC连接
 	grpcClient     serverpb.DatabaseServiceClient // gRPC客户端
-	// 添加TCP连接池用于同步操作
-	syncConn   net.Conn   // 专用于同步的TCP连接
-	syncConnMu sync.Mutex // 保护同步连接的互斥锁
 }
 
 // ClientSession 客户端会话
@@ -254,64 +250,62 @@ func (cn *CoordinatorNode) startSystem() {
 	go cn.performStartupDataCatchup()
 }
 
-// electPrimaryNode 选举主节点
+// electPrimaryNodeWithForce 选举主节点，可以强制重新选举
 func (cn *CoordinatorNode) electPrimaryNode() {
 	if len(cn.serverNodes) == 0 {
 		return
 	}
 
-	// 如果已经有主节点且状态正常，不需要重新选举
-	if cn.primaryNode != nil && cn.primaryNode.Status == NodeStatusActive {
-		return
-	}
-
 	logger.Info("Starting primary node election...")
 
-	// 从活跃节点中选择LSN最高的作为主节点
-	var candidates []*ServerNode
+	// 找出LSN最高的节点
+	var bestCandidate *ServerNode
 	maxLSN := int64(-1)
 
 	// 先打印所有节点的当前状态
 	logger.Info("Current node status:")
 	for _, node := range cn.serverNodes {
 		logger.Info("  Node %s: Status=%s, LSN=%d", node.ID, node.Status.String(), node.LSN)
-	}
 
-	for _, node := range cn.serverNodes {
-		if node.Status == NodeStatusActive {
-			if node.LSN > maxLSN {
-				maxLSN = node.LSN
-				candidates = []*ServerNode{node}
-				logger.Info("New candidate with higher LSN: %s (LSN: %d)", node.ID, node.LSN)
-			} else if node.LSN == maxLSN {
-				candidates = append(candidates, node)
-				logger.Info("Additional candidate with same LSN: %s (LSN: %d)", node.ID, node.LSN)
-			}
+		// 只考虑活跃节点
+		if node.Status == NodeStatusActive && node.LSN > maxLSN {
+			maxLSN = node.LSN
+			bestCandidate = node
 		}
 	}
 
-	if len(candidates) == 0 {
+	if bestCandidate == nil {
 		logger.Error("No active nodes available for primary election")
 		return
 	}
 
-	logger.Info("Election candidates with max LSN %d: %d nodes", maxLSN, len(candidates))
-
-	// 如果有多个候选者，随机选择一个
-	rand.Seed(time.Now().UnixNano())
-	selected := candidates[rand.Intn(len(candidates))]
-
-	// 更新之前的主节点为从节点
+	// 如果当前存在主节点，进行比较
 	if cn.primaryNode != nil {
-		cn.primaryNode.Role = NodeRoleReplica
-		logger.Info("Demoting previous primary node %s to replica", cn.primaryNode.ID)
+		if cn.primaryNode.Status == NodeStatusActive && bestCandidate.LSN > cn.primaryNode.LSN {
+			// 新候选者LSN更高或主节点宕机，更换主节点
+			logger.Info("Found better candidate %s (LSN: %d) than current primary %s (LSN: %d)",
+				bestCandidate.ID, bestCandidate.LSN, cn.primaryNode.ID, cn.primaryNode.LSN)
+
+			// 降级当前主节点
+			cn.primaryNode.Role = NodeRoleReplica
+			logger.Info("Demoting previous primary node %s to replica", cn.primaryNode.ID)
+
+			// 设置新主节点
+			bestCandidate.Role = NodeRolePrimary
+			cn.primaryNode = bestCandidate
+
+			logger.Info("Elected new primary node: %s (LSN: %d)", bestCandidate.ID, bestCandidate.LSN)
+		} else {
+			logger.Info("Current primary %s (LSN: %d) remains the best candidate",
+				cn.primaryNode.ID, cn.primaryNode.LSN)
+		}
+	} else {
+		// 不存在主节点，直接选择LSN最高的
+		bestCandidate.Role = NodeRolePrimary
+		cn.primaryNode = bestCandidate
+
+		logger.Info("Elected new primary node: %s (LSN: %d)", bestCandidate.ID, bestCandidate.LSN)
 	}
-
-	// 设置新的主节点
-	selected.Role = NodeRolePrimary
-	cn.primaryNode = selected
-
-	logger.Info("Elected new primary node: %s (LSN: %d)", selected.ID, selected.LSN)
 }
 
 // handleClient 处理客户端连接
@@ -416,13 +410,10 @@ func (cn *CoordinatorNode) forwardToMasterForClient(session *ClientSession, comm
 			session.serverConn = nil
 		}
 
-		// 如果主节点连接失败，标记为DOWN并重新选举
+		// 如果主节点连接失败，直接移除主节点并重新选举
 		cn.mu.Lock()
-		primary.Status = NodeStatusDown
-		// 清理TCP连接
-		if primary.syncConn != nil {
-			primary.syncConn.Close()
-			primary.syncConn = nil
+		if primary != nil {
+			cn.removeNode(primary.ID, "connection failed")
 		}
 		cn.electPrimaryNode()
 		cn.mu.Unlock()
@@ -431,9 +422,9 @@ func (cn *CoordinatorNode) forwardToMasterForClient(session *ClientSession, comm
 	}
 
 	// 如果是写操作，需要同步到从节点
-	if cn.isWriteCommand(command) {
-		go cn.syncToReplicas(command)
-	}
+	// if cn.isWriteCommand(command) {
+	// 	go cn.syncToReplicas(command)
+	// }
 
 	return response
 }
@@ -459,57 +450,6 @@ func (cn *CoordinatorNode) sendCommandToClientServerConn(session *ClientSession,
 	return "", fmt.Errorf("no response from server")
 }
 
-// sendCommandToNodeTCP 通过TCP连接发送命令到节点 - 复用主节点的操作方式
-func (cn *CoordinatorNode) sendCommandToNodeTCP(node *ServerNode, command string) (string, error) {
-	// 使用锁保护同步连接
-	node.syncConnMu.Lock()
-	defer node.syncConnMu.Unlock()
-
-	// 如果同步连接不存在或已断开，建立新连接
-	if node.syncConn == nil {
-		conn, err := cn.connectToServer(node)
-		if err != nil {
-			return "", fmt.Errorf("failed to connect to node %s: %v", node.ID, err)
-		}
-		node.syncConn = conn
-
-		// 读取并丢弃服务器的欢迎消息，和主节点操作一样
-		scanner := bufio.NewScanner(node.syncConn)
-		// 读取第一行: "Connected to Interactive Database Server"
-		if scanner.Scan() {
-			// 丢弃欢迎消息
-		}
-		// 读取第二行: "Type 'HELP' for available commands, 'EXIT' to quit"
-		if scanner.Scan() {
-			// 丢弃提示消息
-		}
-	}
-
-	// 发送命令，和主节点操作一样
-	_, err := node.syncConn.Write([]byte(command + "\n"))
-	if err != nil {
-		// 连接可能断开，关闭并重置
-		node.syncConn.Close()
-		node.syncConn = nil
-		return "", err
-	}
-
-	// 读取响应，和主节点操作一样
-	scanner := bufio.NewScanner(node.syncConn)
-	if scanner.Scan() {
-		return scanner.Text(), nil
-	}
-
-	if err := scanner.Err(); err != nil {
-		// 连接可能断开，关闭并重置
-		node.syncConn.Close()
-		node.syncConn = nil
-		return "", err
-	}
-
-	return "", fmt.Errorf("no response from server")
-}
-
 // isWriteCommand 判断是否为写命令
 func (cn *CoordinatorNode) isWriteCommand(command string) bool {
 	parts := strings.Fields(strings.ToUpper(command))
@@ -526,7 +466,7 @@ func (cn *CoordinatorNode) isWriteCommand(command string) bool {
 	return false
 }
 
-// syncToReplicas 异步同步写操作到从节点 - 使用TCP连接，和主节点操作一样
+// syncToReplicas 异步同步写操作到从节点
 func (cn *CoordinatorNode) syncToReplicas(command string) {
 	cn.mu.RLock()
 	replicas := make([]*ServerNode, 0)
@@ -552,8 +492,7 @@ func (cn *CoordinatorNode) syncToReplicas(command string) {
 				// 添加重试机制
 				maxRetries := 2
 				for retry := 0; retry <= maxRetries; retry++ {
-					// 使用TCP连接发送命令，和主节点操作一样
-					_, err := cn.sendCommandToNodeTCP(n, command)
+					_, err := cn.sendCommandToNode(n, command)
 					if err == nil {
 						// 成功，不需要记录日志避免日志泛滥
 						return
@@ -563,15 +502,10 @@ func (cn *CoordinatorNode) syncToReplicas(command string) {
 						// 重试前等待一下
 						time.Sleep(time.Duration(retry+1) * 500 * time.Millisecond)
 					} else {
-						// 最终失败，标记节点为DOWN
-						logger.Error("Failed to sync to replica %s after %d retries: %v", n.ID, maxRetries+1, err)
+						// 最终失败，直接移除节点
+						logger.Error("Failed to sync to replica %s after %d retries: %v, removing node", n.ID, maxRetries+1, err)
 						cn.mu.Lock()
-						n.Status = NodeStatusDown
-						// 清理TCP连接
-						if n.syncConn != nil {
-							n.syncConn.Close()
-							n.syncConn = nil
-						}
+						cn.removeNode(n.ID, "sync failed")
 						cn.mu.Unlock()
 					}
 				}
@@ -619,29 +553,30 @@ func (cn *CoordinatorNode) checkNodeHealth() {
 
 	now := time.Now()
 	primaryDown := false
+	nodesToRemove := make([]string, 0)
 
-	for _, node := range cn.serverNodes {
+	for nodeID, node := range cn.serverNodes {
 		if now.Sub(node.LastSeen) > heartbeatTimeout {
-			if node.Status == NodeStatusActive {
-				logger.Info("Node %s marked as DOWN (last seen: %v)", node.ID, node.LastSeen)
-				node.Status = NodeStatusDown
-
-				// 清理TCP连接
-				if node.syncConn != nil {
-					node.syncConn.Close()
-					node.syncConn = nil
-				}
+			if node.Status == NodeStatusActive || node.Status == NodeStatusSyncing {
+				logger.Info("Node %s is unresponsive (last seen: %v), removing from system", nodeID, node.LastSeen)
 
 				if node.Role == NodeRolePrimary {
 					primaryDown = true
 				}
+
+				nodesToRemove = append(nodesToRemove, nodeID)
 			}
 		}
 	}
 
+	// 移除所有宕机的节点
+	for _, nodeID := range nodesToRemove {
+		cn.removeNode(nodeID, "heartbeat timeout")
+	}
+
 	// 如果主节点下线，重新选举
 	if primaryDown {
-		logger.Info("Primary node is down, starting election...")
+		logger.Info("Primary node was removed, starting election...")
 		cn.electPrimaryNode()
 	}
 }
@@ -1107,6 +1042,63 @@ func (cn *CoordinatorNode) performPeriodicDataCatchup() {
 	}
 }
 
+// syncNewPrimaryToReplicas 新主节点选举后，同步数据到所有副本节点
+func (cn *CoordinatorNode) syncNewPrimaryToReplicas(newPrimary *ServerNode) {
+	logger.Info("Starting sync from new primary %s to all replicas", newPrimary.ID)
+
+	cn.mu.RLock()
+	replicas := make([]*ServerNode, 0)
+	for _, node := range cn.serverNodes {
+		if node.Role == NodeRoleReplica && node.Status == NodeStatusActive {
+			replicas = append(replicas, node)
+		}
+	}
+	cn.mu.RUnlock()
+
+	if len(replicas) == 0 {
+		logger.Info("No active replicas found for sync from new primary %s", newPrimary.ID)
+		return
+	}
+
+	logger.Info("Syncing from new primary %s (LSN: %d) to %d replicas",
+		newPrimary.ID, newPrimary.LSN, len(replicas))
+
+	// 并行同步到所有副本节点
+	var wg sync.WaitGroup
+	for _, replica := range replicas {
+		wg.Add(1)
+		go func(r *ServerNode) {
+			defer wg.Done()
+
+			// 使用读锁获取LSN差异
+			cn.mu.RLock()
+			lsnDiff := newPrimary.LSN - r.LSN
+			cn.mu.RUnlock()
+
+			if lsnDiff > 0 {
+				logger.Info("Syncing to replica %s (LSN diff: %d)", r.ID, lsnDiff)
+				cn.performSyncWithRetry(r, newPrimary)
+			} else {
+				logger.Info("Replica %s is already up-to-date (LSN: %d)", r.ID, r.LSN)
+			}
+		}(replica)
+	}
+
+	// 等待所有同步完成，但设置超时
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		logger.Info("New primary sync completed for all %d replicas", len(replicas))
+	case <-time.After(60 * time.Second):
+		logger.Error("New primary sync timeout after 60 seconds")
+	}
+}
+
 // RegisterServer 实现gRPC RegisterServer方法
 func (cn *CoordinatorNode) RegisterServer(ctx context.Context, req *pb.RegisterRequest) (*pb.RegisterResponse, error) {
 	logger.Info("Received gRPC registration request from %s:%s (ID: %s, LSN: %d)", req.Address, req.Port, req.NodeId, req.Lsn)
@@ -1160,7 +1152,32 @@ func (cn *CoordinatorNode) RegisterServer(ctx context.Context, req *pb.RegisterR
 			existingNode.grpcClient = serverpb.NewDatabaseServiceClient(grpcConn)
 		}
 
+		// 检查重复注册的节点是否需要重新选主
+		shouldReelect := cn.started && cn.primaryNode != nil && existingNode.LSN > cn.primaryNode.LSN
+		primaryNodeID := ""
+		primaryLSN := int64(0)
+		if cn.primaryNode != nil {
+			primaryNodeID = cn.primaryNode.ID
+			primaryLSN = cn.primaryNode.LSN
+		}
 		cn.mu.Unlock() // 重复注册处理完成，释放锁
+
+		// 如果重复注册节点的LSN更高，重新选主
+		if shouldReelect {
+			logger.Info("Re-registering node %s has higher LSN (%d) than current primary %s (%d), triggering re-election",
+				existingNode.ID, existingNode.LSN, primaryNodeID, primaryLSN)
+			cn.mu.Lock()
+			cn.electPrimaryNode() // 强制重新选举
+			newPrimary := cn.primaryNode
+			cn.mu.Unlock()
+
+			// 重新选主后，如果重复注册的节点成为新主节点，需要数据同步
+			if newPrimary != nil && newPrimary.ID == existingNode.ID {
+				logger.Info("Re-registering node %s has been elected as primary, syncing data to replicas", existingNode.ID)
+				go cn.syncNewPrimaryToReplicas(existingNode)
+			}
+		}
+
 		return &pb.RegisterResponse{
 			Success: true,
 			Role:    existingNode.Role.String(),
@@ -1247,13 +1264,38 @@ func (cn *CoordinatorNode) RegisterServer(ctx context.Context, req *pb.RegisterR
 		// 打印当前注册的节点
 		logger.Info("Current registered nodes: %v", cn.serverNodes)
 
-		// 系统已经运行，检查当前注册的节点是否需要同步
+		// 系统已经运行，检查是否需要重新选主
 		cn.mu.RLock()
+		shouldReelect := cn.started && cn.primaryNode != nil && node.LSN > cn.primaryNode.LSN
 		needsCatchup := cn.started && cn.primaryNode != nil && node.LSN < cn.primaryNode.LSN
+		primaryNodeID := ""
+		primaryLSN := int64(0)
+		if cn.primaryNode != nil {
+			primaryNodeID = cn.primaryNode.ID
+			primaryLSN = cn.primaryNode.LSN
+		}
 		cn.mu.RUnlock()
 
-		// 如果系统已启动且新节点LSN小于主节点，启动数据同步
-		if needsCatchup {
+		// 如果新节点的LSN更高，重新选主
+		if shouldReelect {
+			logger.Info("New node %s has higher LSN (%d) than current primary %s (%d), triggering re-election",
+				node.ID, node.LSN, primaryNodeID, primaryLSN)
+			cn.mu.Lock()
+			cn.electPrimaryNode() // 强制重新选举
+			cn.mu.Unlock()
+
+			// 重新选主后，可能需要数据同步
+			cn.mu.RLock()
+			newPrimary := cn.primaryNode
+			cn.mu.RUnlock()
+
+			if newPrimary != nil && newPrimary.ID == node.ID {
+				logger.Info("New node %s has been elected as primary, syncing data to replicas", node.ID)
+				// 新主节点需要将数据同步到其他副本节点
+				go cn.syncNewPrimaryToReplicas(node)
+			}
+		} else if needsCatchup {
+			// 如果系统已启动且新节点LSN小于主节点，启动数据同步
 			go cn.performDataCatchup(node)
 		}
 	}
@@ -1271,18 +1313,20 @@ func (cn *CoordinatorNode) Heartbeat(ctx context.Context, req *pb.HeartbeatReque
 	// 更新节点的最后心跳时间和LSN
 	cn.mu.Lock()
 	if node, exists := cn.serverNodes[req.NodeId]; exists {
-		oldStatus := node.Status
 		node.LastSeen = time.Now()
 		node.LSN = req.Lsn
-		// 如果节点之前是DOWN状态，重新标记为ACTIVE
-		if node.Status == NodeStatusDown {
-			logger.Info("Node %s is back online", req.NodeId)
+		// 确保节点状态为活跃（可能从Syncing状态恢复）
+		if node.Status != NodeStatusActive {
 			node.Status = NodeStatusActive
 		}
-		// 只在状态变化时记录日志
-		if oldStatus != node.Status {
-			logger.Info("Node %s status changed from %s to %s", req.NodeId, oldStatus.String(), node.Status.String())
-		}
+	} else {
+		// 如果节点不存在，说明它之前被移除了，需要重新注册
+		logger.Info("Received heartbeat from unregistered node %s, ignoring", req.NodeId)
+		cn.mu.Unlock()
+		return &pb.HeartbeatResponse{
+			Success:   false,
+			Timestamp: time.Now().Unix(),
+		}, nil
 	}
 	cn.mu.Unlock()
 
@@ -1302,6 +1346,39 @@ func (cn *CoordinatorNode) StreamBackup(req *pb.BackupRequest, stream pb.Coordin
 func (cn *CoordinatorNode) StreamRestore(stream pb.CoordinatorService_StreamRestoreServer) error {
 	// 这个方法在当前架构中不需要，因为CN是主动推送数据到server，而不是server从CN拉取
 	return fmt.Errorf("not implemented: CN pushes data to servers, not pulled by servers")
+}
+
+// removeNode 安全地移除节点（调用前需要持有写锁）
+func (cn *CoordinatorNode) removeNode(nodeID string, reason string) {
+	node, exists := cn.serverNodes[nodeID]
+	if !exists {
+		return
+	}
+
+	logger.Info("Removing node %s from system (reason: %s)", nodeID, reason)
+
+	// 关闭gRPC连接
+	if node.grpcConn != nil {
+		node.grpcConn.Close()
+		node.grpcConn = nil
+		node.grpcClient = nil
+	}
+
+	// 关闭TCP连接
+	if node.conn != nil {
+		node.conn.Close()
+		node.conn = nil
+	}
+
+	// 如果是主节点被移除，清空主节点引用
+	if cn.primaryNode != nil && cn.primaryNode.ID == nodeID {
+		cn.primaryNode = nil
+	}
+
+	// 从节点列表中删除
+	delete(cn.serverNodes, nodeID)
+
+	logger.Info("Node %s removed from system. Remaining nodes: %d", nodeID, len(cn.serverNodes))
 }
 
 func main() {
