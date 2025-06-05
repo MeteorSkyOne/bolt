@@ -621,6 +621,14 @@ func (ds *DatabaseServer) commitTransaction(session *ClientSession) string {
 		return "Error: No active transaction"
 	}
 
+	// 检查事务状态一致性
+	if session.boltTx == nil {
+		// 重置不一致的状态
+		session.inTransaction = false
+		session.transactionOps = make([]TransactionOperation, 0)
+		return "Error: Transaction state is inconsistent"
+	}
+
 	// 首先关闭只读事务
 	if err := session.boltTx.Rollback(); err != nil {
 		return fmt.Sprintf("Error closing read transaction: %v", err)
@@ -665,9 +673,11 @@ func (ds *DatabaseServer) abortTransaction(session *ClientSession) string {
 		return "Error: No active transaction"
 	}
 
-	// 关闭只读事务
-	if err := session.boltTx.Rollback(); err != nil {
-		logger.Error("Error rolling back transaction for client %s: %v", session.ID, err)
+	// 检查事务状态一致性并关闭只读事务
+	if session.boltTx != nil {
+		if err := session.boltTx.Rollback(); err != nil {
+			logger.Error("Error rolling back transaction for client %s: %v", session.ID, err)
+		}
 	}
 
 	// 清理事务状态，不执行任何操作
@@ -679,7 +689,7 @@ func (ds *DatabaseServer) abortTransaction(session *ClientSession) string {
 
 // getValueFromCacheOrDB 从缓存或数据库获取值（使用BoltDB原生事务隔离）
 func (ds *DatabaseServer) getValueFromCacheOrDB(session *ClientSession, key string) (string, bool) {
-	if session.inTransaction {
+	if session.inTransaction && session.boltTx != nil {
 		// 使用同一个BoltDB事务确保一致性读取
 		b := session.boltTx.Bucket([]byte(bucketName))
 		data := b.Get([]byte(key))
@@ -756,7 +766,7 @@ func (ds *DatabaseServer) put(session *ClientSession, key, value string) string 
 		finalValue = value
 	}
 
-	if session.inTransaction {
+	if session.inTransaction && session.boltTx != nil {
 		// 在事务中，添加到操作列表
 		session.transactionOps = append(session.transactionOps, TransactionOperation{
 			Type:  "PUT",
@@ -794,7 +804,7 @@ func (ds *DatabaseServer) get(session *ClientSession, key string) string {
 
 // delete 删除键值对
 func (ds *DatabaseServer) delete(session *ClientSession, key string) string {
-	if session.inTransaction {
+	if session.inTransaction && session.boltTx != nil {
 		// 检查key是否存在于事务视图中
 		_, exists := ds.getValueFromCacheOrDB(session, key)
 		if !exists {
@@ -874,7 +884,7 @@ func (ds *DatabaseServer) showAll(session *ClientSession) string {
 	}
 
 	// 如果在事务中，显示事务状态
-	if session.inTransaction {
+	if session.inTransaction && session.boltTx != nil {
 		result.WriteString(fmt.Sprintf("Transaction status: %d operations pending", len(session.transactionOps)))
 	}
 

@@ -92,6 +92,9 @@ type ServerNode struct {
 	conn           net.Conn                       // 到该节点的连接（TCP，用于客户端请求转发）
 	grpcConn       *grpc.ClientConn               // gRPC连接
 	grpcClient     serverpb.DatabaseServiceClient // gRPC客户端
+	// 添加TCP连接池用于同步操作
+	syncConn   net.Conn   // 专用于同步的TCP连接
+	syncConnMu sync.Mutex // 保护同步连接的互斥锁
 }
 
 // ClientSession 客户端会话
@@ -416,6 +419,11 @@ func (cn *CoordinatorNode) forwardToMasterForClient(session *ClientSession, comm
 		// 如果主节点连接失败，标记为DOWN并重新选举
 		cn.mu.Lock()
 		primary.Status = NodeStatusDown
+		// 清理TCP连接
+		if primary.syncConn != nil {
+			primary.syncConn.Close()
+			primary.syncConn = nil
+		}
 		cn.electPrimaryNode()
 		cn.mu.Unlock()
 
@@ -451,6 +459,57 @@ func (cn *CoordinatorNode) sendCommandToClientServerConn(session *ClientSession,
 	return "", fmt.Errorf("no response from server")
 }
 
+// sendCommandToNodeTCP 通过TCP连接发送命令到节点 - 复用主节点的操作方式
+func (cn *CoordinatorNode) sendCommandToNodeTCP(node *ServerNode, command string) (string, error) {
+	// 使用锁保护同步连接
+	node.syncConnMu.Lock()
+	defer node.syncConnMu.Unlock()
+
+	// 如果同步连接不存在或已断开，建立新连接
+	if node.syncConn == nil {
+		conn, err := cn.connectToServer(node)
+		if err != nil {
+			return "", fmt.Errorf("failed to connect to node %s: %v", node.ID, err)
+		}
+		node.syncConn = conn
+
+		// 读取并丢弃服务器的欢迎消息，和主节点操作一样
+		scanner := bufio.NewScanner(node.syncConn)
+		// 读取第一行: "Connected to Interactive Database Server"
+		if scanner.Scan() {
+			// 丢弃欢迎消息
+		}
+		// 读取第二行: "Type 'HELP' for available commands, 'EXIT' to quit"
+		if scanner.Scan() {
+			// 丢弃提示消息
+		}
+	}
+
+	// 发送命令，和主节点操作一样
+	_, err := node.syncConn.Write([]byte(command + "\n"))
+	if err != nil {
+		// 连接可能断开，关闭并重置
+		node.syncConn.Close()
+		node.syncConn = nil
+		return "", err
+	}
+
+	// 读取响应，和主节点操作一样
+	scanner := bufio.NewScanner(node.syncConn)
+	if scanner.Scan() {
+		return scanner.Text(), nil
+	}
+
+	if err := scanner.Err(); err != nil {
+		// 连接可能断开，关闭并重置
+		node.syncConn.Close()
+		node.syncConn = nil
+		return "", err
+	}
+
+	return "", fmt.Errorf("no response from server")
+}
+
 // isWriteCommand 判断是否为写命令
 func (cn *CoordinatorNode) isWriteCommand(command string) bool {
 	parts := strings.Fields(strings.ToUpper(command))
@@ -467,7 +526,7 @@ func (cn *CoordinatorNode) isWriteCommand(command string) bool {
 	return false
 }
 
-// syncToReplicas 异步同步写操作到从节点
+// syncToReplicas 异步同步写操作到从节点 - 使用TCP连接，和主节点操作一样
 func (cn *CoordinatorNode) syncToReplicas(command string) {
 	cn.mu.RLock()
 	replicas := make([]*ServerNode, 0)
@@ -493,7 +552,8 @@ func (cn *CoordinatorNode) syncToReplicas(command string) {
 				// 添加重试机制
 				maxRetries := 2
 				for retry := 0; retry <= maxRetries; retry++ {
-					_, err := cn.sendCommandToNode(n, command)
+					// 使用TCP连接发送命令，和主节点操作一样
+					_, err := cn.sendCommandToNodeTCP(n, command)
 					if err == nil {
 						// 成功，不需要记录日志避免日志泛滥
 						return
@@ -507,6 +567,11 @@ func (cn *CoordinatorNode) syncToReplicas(command string) {
 						logger.Error("Failed to sync to replica %s after %d retries: %v", n.ID, maxRetries+1, err)
 						cn.mu.Lock()
 						n.Status = NodeStatusDown
+						// 清理TCP连接
+						if n.syncConn != nil {
+							n.syncConn.Close()
+							n.syncConn = nil
+						}
 						cn.mu.Unlock()
 					}
 				}
@@ -560,6 +625,12 @@ func (cn *CoordinatorNode) checkNodeHealth() {
 			if node.Status == NodeStatusActive {
 				logger.Info("Node %s marked as DOWN (last seen: %v)", node.ID, node.LastSeen)
 				node.Status = NodeStatusDown
+
+				// 清理TCP连接
+				if node.syncConn != nil {
+					node.syncConn.Close()
+					node.syncConn = nil
+				}
 
 				if node.Role == NodeRolePrimary {
 					primaryDown = true
