@@ -1,0 +1,64 @@
+syntax = "proto3";
+
+option go_package = "cmd/proto/server";
+
+package server;
+
+// 数据库服务器服务
+service DatabaseService {
+  // 执行数据库命令
+  rpc ExecuteCommand(CommandRequest) returns (CommandResponse);
+  
+  // 数据备份流（server流式发送数据）
+  rpc StreamBackup(BackupRequest) returns (stream BackupChunk);
+  
+  // 数据恢复流（接收流式数据并恢复）
+  rpc StreamRestore(stream RestoreChunk) returns (RestoreResponse);
+  
+  // 获取LSN
+  rpc GetLSN(Empty) returns (LSNResponse);
+}
+
+// 空消息
+message Empty {}
+
+// 命令请求
+message CommandRequest {
+  string command = 1;
+}
+
+// 命令响应
+message CommandResponse {
+  string result = 1;
+  bool success = 2;
+}
+
+// 备份请求
+message BackupRequest {
+  string source_node_id = 1;
+}
+
+// 备份数据块
+message BackupChunk {
+  bytes data = 1;
+  int64 total_size = 2;
+  bool is_last = 3;
+}
+
+// 恢复数据块
+message RestoreChunk {
+  bytes data = 1;
+  int64 total_size = 2;
+  bool is_last = 3;
+}
+
+// 恢复响应
+message RestoreResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// LSN响应
+message LSNResponse {
+  int64 lsn = 1;
+} 

@@ -1,7 +1,7 @@
 *.prof
 *.test
 *.swp
-*/bin/
+bin/
 *.log
 *.db
 test_output/
