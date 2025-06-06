@@ -690,7 +690,20 @@ func (ds *DatabaseServer) abortTransaction(session *ClientSession) string {
 // getValueFromCacheOrDB 从缓存或数据库获取值（使用BoltDB原生事务隔离）
 func (ds *DatabaseServer) getValueFromCacheOrDB(session *ClientSession, key string) (string, bool) {
 	if session.inTransaction && session.boltTx != nil {
-		// 使用同一个BoltDB事务确保一致性读取
+		// 在事务中，首先检查事务操作缓存
+		// 从后往前查找，以获取最新的操作
+		for i := len(session.transactionOps) - 1; i >= 0; i-- {
+			op := session.transactionOps[i]
+			if op.Key == key {
+				if op.Type == "PUT" {
+					return op.Value, true
+				} else if op.Type == "DEL" {
+					return "", false // 在事务中被删除，返回未找到
+				}
+			}
+		}
+
+		// 如果在事务操作缓存中没有找到，从BoltDB事务快照中查找
 		b := session.boltTx.Bucket([]byte(bucketName))
 		data := b.Get([]byte(key))
 		if data != nil {
@@ -860,32 +873,74 @@ func (ds *DatabaseServer) showAll(session *ClientSession) string {
 	var result strings.Builder
 	var count int
 
-	err := ds.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(bucketName))
-		c := b.Cursor()
+	// 如果在事务中，需要合并数据库快照和事务操作
+	if session.inTransaction && session.boltTx != nil {
+		// 创建一个映射来存储最终的键值对
+		dataMap := make(map[string]string)
 
-		result.WriteString("Current database contents:\n")
-		for k, v := c.First(); k != nil; k, v = c.Next() {
-			// 跳过LSN键
-			if string(k) != lsnKey {
-				result.WriteString(fmt.Sprintf("  %s: %s\n", string(k), string(v)))
-				count++
+		// 首先从数据库快照中读取所有数据
+		err := ds.db.View(func(tx *bolt.Tx) error {
+			b := tx.Bucket([]byte(bucketName))
+			c := b.Cursor()
+
+			for k, v := c.First(); k != nil; k, v = c.Next() {
+				// 跳过LSN键
+				if string(k) != lsnKey {
+					dataMap[string(k)] = string(v)
+				}
+			}
+			return nil
+		})
+
+		if err != nil {
+			return fmt.Sprintf("Error reading database: %v", err)
+		}
+
+		// 然后应用事务内的操作
+		for _, op := range session.transactionOps {
+			if op.Type == "PUT" {
+				dataMap[op.Key] = op.Value
+			} else if op.Type == "DEL" {
+				delete(dataMap, op.Key)
 			}
 		}
-		return nil
-	})
 
-	if err != nil {
-		return fmt.Sprintf("Error reading database: %v", err)
-	}
+		// 显示合并后的结果
+		result.WriteString("Current database contents (including transaction changes):\n")
+		for key, value := range dataMap {
+			result.WriteString(fmt.Sprintf("  %s: %s\n", key, value))
+			count++
+		}
 
-	if count == 0 {
-		result.WriteString("Database is empty\n")
-	}
+		if count == 0 {
+			result.WriteString("Database is empty\n")
+		}
 
-	// 如果在事务中，显示事务状态
-	if session.inTransaction && session.boltTx != nil {
 		result.WriteString(fmt.Sprintf("Transaction status: %d operations pending", len(session.transactionOps)))
+	} else {
+		// 非事务模式，直接显示数据库内容
+		err := ds.db.View(func(tx *bolt.Tx) error {
+			b := tx.Bucket([]byte(bucketName))
+			c := b.Cursor()
+
+			result.WriteString("Current database contents:\n")
+			for k, v := c.First(); k != nil; k, v = c.Next() {
+				// 跳过LSN键
+				if string(k) != lsnKey {
+					result.WriteString(fmt.Sprintf("  %s: %s\n", string(k), string(v)))
+					count++
+				}
+			}
+			return nil
+		})
+
+		if err != nil {
+			return fmt.Sprintf("Error reading database: %v", err)
+		}
+
+		if count == 0 {
+			result.WriteString("Database is empty\n")
+		}
 	}
 
 	return strings.TrimSuffix(result.String(), "\n")

@@ -57,7 +57,29 @@ func (tx *Tx) init(db *DB) {
 	// Increment the transaction id and add a page cache for writable transactions.
 	if tx.writable {
 		tx.pages = make(map[pgid]*page)
-		tx.meta.txid += txid(1)
+
+		// 使用时间戳作为事务ID，确保单调递增
+		newTxid := txid(time.Now().UnixNano())
+
+		// 确保新的txid大于当前的txid，处理时钟回退的情况
+		if newTxid <= tx.meta.txid {
+			newTxid = tx.meta.txid + 1
+		}
+
+		// 保持奇偶性，第一次生成为奇数
+		if tx.meta.txid == 0 {
+			// 第一次，确保为奇数
+			if newTxid%2 == 0 {
+				newTxid++
+			}
+		} else {
+			// 后续保持奇偶性交替
+			if newTxid%2 == tx.meta.txid%2 {
+				newTxid++
+			}
+		}
+
+		tx.meta.txid = newTxid
 	}
 }
 
