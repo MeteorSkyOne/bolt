@@ -73,21 +73,13 @@ type HeartbeatRequest struct {
 	LSN    int64  `json:"lsn"`
 }
 
-// TransactionOperation 事务操作类型
-type TransactionOperation struct {
-	Type  string // "PUT", "GET", "DEL"
-	Key   string
-	Value string
-}
-
 // ClientSession 客户端会话
 type ClientSession struct {
-	ID             string
-	conn           net.Conn
-	inTransaction  bool
-	kvdbTx         *kvdb.Tx
-	transactionOps []TransactionOperation
-	mu             sync.RWMutex
+	ID            string
+	conn          net.Conn
+	inTransaction bool
+	kvdbTx        *kvdb.Tx
+	mu            sync.RWMutex
 }
 
 // DatabaseServer 数据库服务器
@@ -441,11 +433,10 @@ func (ds *DatabaseServer) Start(port string) error {
 		// 为每个客户端创建会话并启动goroutine处理
 		clientID := fmt.Sprintf("client_%d", time.Now().UnixNano())
 		session := &ClientSession{
-			ID:             clientID,
-			conn:           conn,
-			inTransaction:  false,
-			kvdbTx:         nil,
-			transactionOps: make([]TransactionOperation, 0),
+			ID:            clientID,
+			conn:          conn,
+			inTransaction: false,
+			kvdbTx:        nil,
 		}
 
 		ds.clientMu.Lock()
@@ -603,14 +594,13 @@ func (ds *DatabaseServer) beginTransaction(session *ClientSession) string {
 		return "Error: Already in transaction"
 	}
 
-	tx, err := ds.db.Begin(false)
+	tx, err := ds.db.Begin(true) // 使用可写事务
 	if err != nil {
 		return fmt.Sprintf("Error starting transaction: %v", err)
 	}
 
 	session.inTransaction = true
 	session.kvdbTx = tx
-	session.transactionOps = make([]TransactionOperation, 0)
 	return "BEGIN -> transaction started"
 }
 
@@ -624,35 +614,11 @@ func (ds *DatabaseServer) commitTransaction(session *ClientSession) string {
 	if session.kvdbTx == nil {
 		// 重置不一致的状态
 		session.inTransaction = false
-		session.transactionOps = make([]TransactionOperation, 0)
 		return "Error: Transaction state is inconsistent"
 	}
 
-	// 首先关闭只读事务
-	if err := session.kvdbTx.Rollback(); err != nil {
-		return fmt.Sprintf("Error closing read transaction: %v", err)
-	}
-
-	// 执行所有缓存的操作
-	err := ds.db.Update(func(tx *kvdb.Tx) error {
-		b := tx.Bucket([]byte(bucketName))
-
-		for _, op := range session.transactionOps {
-			switch op.Type {
-			case "PUT":
-				if err := b.Put([]byte(op.Key), []byte(op.Value)); err != nil {
-					return err
-				}
-			case "DEL":
-				if err := b.Delete([]byte(op.Key)); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	})
-
-	if err != nil {
+	// 提交事务
+	if err := session.kvdbTx.Commit(); err != nil {
 		return fmt.Sprintf("Error committing transaction: %v", err)
 	}
 
@@ -662,7 +628,6 @@ func (ds *DatabaseServer) commitTransaction(session *ClientSession) string {
 	// 清理事务状态
 	session.inTransaction = false
 	session.kvdbTx = nil
-	session.transactionOps = make([]TransactionOperation, 0)
 	return "COMMIT -> transaction committed"
 }
 
@@ -672,37 +637,23 @@ func (ds *DatabaseServer) abortTransaction(session *ClientSession) string {
 		return "Error: No active transaction"
 	}
 
-	// 检查事务状态一致性并关闭只读事务
+	// 检查事务状态一致性并回滚事务
 	if session.kvdbTx != nil {
 		if err := session.kvdbTx.Rollback(); err != nil {
 			logger.Error("Error rolling back transaction for client %s: %v", session.ID, err)
 		}
 	}
 
-	// 清理事务状态，不执行任何操作
+	// 清理事务状态
 	session.inTransaction = false
 	session.kvdbTx = nil
-	session.transactionOps = make([]TransactionOperation, 0)
 	return "ABORT -> transaction aborted"
 }
 
-// getValueFromCacheOrDB 从缓存或数据库获取值（使用原生事务隔离）
+// getValueFromCacheOrDB 从事务或数据库获取值（使用原生事务隔离）
 func (ds *DatabaseServer) getValueFromCacheOrDB(session *ClientSession, key string) (string, bool) {
 	if session.inTransaction && session.kvdbTx != nil {
-		// 在事务中，首先检查事务操作缓存
-		// 从后往前查找，以获取最新的操作
-		for i := len(session.transactionOps) - 1; i >= 0; i-- {
-			op := session.transactionOps[i]
-			if op.Key == key {
-				if op.Type == "PUT" {
-					return op.Value, true
-				} else if op.Type == "DEL" {
-					return "", false // 在事务中被删除，返回未找到
-				}
-			}
-		}
-
-		// 如果在事务操作缓存中没有找到，从事务快照中查找
+		// 在事务中，从事务快照中查找
 		b := session.kvdbTx.Bucket([]byte(bucketName))
 		data := b.Get([]byte(key))
 		if data != nil {
@@ -779,13 +730,21 @@ func (ds *DatabaseServer) put(session *ClientSession, key, value string) string 
 	}
 
 	if session.inTransaction && session.kvdbTx != nil {
-		// 在事务中，添加到操作列表
-		session.transactionOps = append(session.transactionOps, TransactionOperation{
-			Type:  "PUT",
-			Key:   key,
-			Value: finalValue,
-		})
-		return fmt.Sprintf("PUT %s %s -> staged in transaction", key, value)
+		// 在事务中，直接操作事务
+		b := session.kvdbTx.Bucket([]byte(bucketName))
+		if b == nil {
+			// 创建bucket如果不存在
+			var err error
+			b, err = session.kvdbTx.CreateBucketIfNotExists([]byte(bucketName))
+			if err != nil {
+				return fmt.Sprintf("Error creating bucket: %v", err)
+			}
+		}
+
+		if err := b.Put([]byte(key), []byte(finalValue)); err != nil {
+			return fmt.Sprintf("Error storing value in transaction: %v", err)
+		}
+		return fmt.Sprintf("PUT %s %s -> stored in transaction", key, value)
 	} else {
 		// 立即执行
 		err := ds.db.Update(func(tx *kvdb.Tx) error {
@@ -823,12 +782,16 @@ func (ds *DatabaseServer) delete(session *ClientSession, key string) string {
 			return fmt.Sprintf("DEL %s -> Key not found", key)
 		}
 
-		// 在事务中，添加到操作列表
-		session.transactionOps = append(session.transactionOps, TransactionOperation{
-			Type: "DEL",
-			Key:  key,
-		})
-		return fmt.Sprintf("DEL %s -> staged in transaction", key)
+		// 在事务中，直接操作事务
+		b := session.kvdbTx.Bucket([]byte(bucketName))
+		if b == nil {
+			return fmt.Sprintf("DEL %s -> Bucket not found", key)
+		}
+
+		if err := b.Delete([]byte(key)); err != nil {
+			return fmt.Sprintf("Error deleting key in transaction: %v", err)
+		}
+		return fmt.Sprintf("DEL %s -> deleted in transaction", key)
 	} else {
 		// 立即执行
 		var found bool
@@ -872,50 +835,26 @@ func (ds *DatabaseServer) showAll(session *ClientSession) string {
 	var result strings.Builder
 	var count int
 
-	// 如果在事务中，需要合并数据库快照和事务操作
+	// 如果在事务中，显示事务视图的数据
 	if session.inTransaction && session.kvdbTx != nil {
-		// 创建一个映射来存储最终的键值对
-		dataMap := make(map[string]string)
-
-		// 首先从数据库快照中读取所有数据
-		err := ds.db.View(func(tx *kvdb.Tx) error {
-			b := tx.Bucket([]byte(bucketName))
+		result.WriteString("Current database contents (transaction view):\n")
+		b := session.kvdbTx.Bucket([]byte(bucketName))
+		if b != nil {
 			c := b.Cursor()
-
 			for k, v := c.First(); k != nil; k, v = c.Next() {
 				// 跳过LSN键
 				if string(k) != lsnKey {
-					dataMap[string(k)] = string(v)
+					result.WriteString(fmt.Sprintf("  %s: %s\n", string(k), string(v)))
+					count++
 				}
 			}
-			return nil
-		})
-
-		if err != nil {
-			return fmt.Sprintf("Error reading database: %v", err)
-		}
-
-		// 然后应用事务内的操作
-		for _, op := range session.transactionOps {
-			if op.Type == "PUT" {
-				dataMap[op.Key] = op.Value
-			} else if op.Type == "DEL" {
-				delete(dataMap, op.Key)
-			}
-		}
-
-		// 显示合并后的结果
-		result.WriteString("Current database contents (including transaction changes):\n")
-		for key, value := range dataMap {
-			result.WriteString(fmt.Sprintf("  %s: %s\n", key, value))
-			count++
 		}
 
 		if count == 0 {
 			result.WriteString("Database is empty\n")
 		}
 
-		result.WriteString(fmt.Sprintf("Transaction status: %d operations pending", len(session.transactionOps)))
+		result.WriteString("Transaction status: active")
 	} else {
 		// 非事务模式，直接显示数据库内容
 		err := ds.db.View(func(tx *kvdb.Tx) error {
@@ -1148,11 +1087,10 @@ func (ds *DatabaseServer) restoreDatabase(session *ClientSession, backupData str
 func (ds *DatabaseServer) ExecuteCommand(ctx context.Context, req *pb.CommandRequest) (*pb.CommandResponse, error) {
 	// 创建临时会话来执行命令
 	session := &ClientSession{
-		ID:             fmt.Sprintf("grpc_%d", time.Now().UnixNano()),
-		conn:           nil,
-		inTransaction:  false,
-		kvdbTx:         nil,
-		transactionOps: make([]TransactionOperation, 0),
+		ID:            fmt.Sprintf("grpc_%d", time.Now().UnixNano()),
+		conn:          nil,
+		inTransaction: false,
+		kvdbTx:        nil,
 	}
 
 	result := ds.executeCommand(session, req.Command)
