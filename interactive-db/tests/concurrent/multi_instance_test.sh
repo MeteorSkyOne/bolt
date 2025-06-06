@@ -43,10 +43,6 @@ if pgrep -f "cmd/coordinator" > /dev/null || pgrep -f "cmd/server" > /dev/null; 
     sleep 2
 fi
 
-# 构建可执行文件
-echo "Building distributed components..."
-make build-cn build-server build-client
-
 # 启动CN节点
 echo "Starting CN (Coordinator Node) on port $CN_PORT..."
 ./bin/cn -port $CN_PORT &

@@ -45,15 +45,6 @@ pkill -f "bin/coordinator" 2>/dev/null || true
 pkill -f "bin/server" 2>/dev/null || true
 sleep 2
 
-# 编译程序
-echo "编译分布式组件..."
-make build-cn build-server build-client
-
-if [ $? -ne 0 ]; then
-    echo "编译失败"
-    exit 1
-fi
-
 # 启动CN节点
 echo "启动CN节点..."
 ./bin/cn -port $CN_PORT &
