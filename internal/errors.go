@@ -2,70 +2,61 @@ package kvdb
 
 import "errors"
 
-// These errors can be returned when opening or calling methods on a DB.
+// 打开或调用数据库方法时可能返回的错误
 var (
-	// ErrDatabaseNotOpen is returned when a DB instance is accessed before it
-	// is opened or after it is closed.
+	// ErrDatabaseNotOpen 当数据库实例在打开之前或关闭之后被访问时返回
 	ErrDatabaseNotOpen = errors.New("database not open")
 
-	// ErrDatabaseOpen is returned when opening a database that is
-	// already open.
+	// ErrDatabaseOpen 当打开一个已经打开的数据库时返回
 	ErrDatabaseOpen = errors.New("database already open")
 
-	// ErrInvalid is returned when both meta pages on a database are invalid.
-	// This typically occurs when a file is not a kvdb database.
+	// ErrInvalid 当数据库的两个元数据页都无效时返回
+	// 通常发生在文件不是 kvdb 数据库时
 	ErrInvalid = errors.New("invalid database")
 
-	// ErrVersionMismatch is returned when the data file was created with a
-	// different version of kvdb.
+	// ErrVersionMismatch 当数据文件是用不同版本的 kvdb 创建时返回
 	ErrVersionMismatch = errors.New("version mismatch")
 
-	// ErrChecksum is returned when either meta page checksum does not match.
+	// ErrChecksum 当任一元数据页校验和不匹配时返回
 	ErrChecksum = errors.New("checksum error")
 
-	// ErrTimeout is returned when a database cannot obtain an exclusive lock
-	// on the data file after the timeout passed to Open().
+	// ErrTimeout 当数据库无法在传递给 Open() 的超时时间内获得独占锁时返回
 	ErrTimeout = errors.New("timeout")
 )
 
-// These errors can occur when beginning or committing a Tx.
+// 开始或提交事务时可能发生的错误
 var (
-	// ErrTxNotWritable is returned when performing a write operation on a
-	// read-only transaction.
+	// ErrTxNotWritable 当在只读事务上执行写操作时返回
 	ErrTxNotWritable = errors.New("tx not writable")
 
-	// ErrTxClosed is returned when committing or rolling back a transaction
-	// that has already been committed or rolled back.
+	// ErrTxClosed 当提交或回滚已经提交或回滚的事务时返回
 	ErrTxClosed = errors.New("tx closed")
 
-	// ErrDatabaseReadOnly is returned when a mutating transaction is started on a
-	// read-only database.
+	// ErrDatabaseReadOnly 当在只读数据库上启动变更事务时返回
 	ErrDatabaseReadOnly = errors.New("database is in read-only mode")
 )
 
-// These errors can occur when putting or deleting a value or a bucket.
+// 设置或删除值或存储桶时可能发生的错误
 var (
-	// ErrBucketNotFound is returned when trying to access a bucket that has
-	// not been created yet.
+	// ErrBucketNotFound 当尝试访问尚未创建的存储桶时返回
 	ErrBucketNotFound = errors.New("bucket not found")
 
-	// ErrBucketExists is returned when creating a bucket that already exists.
+	// ErrBucketExists 当创建已存在的存储桶时返回
 	ErrBucketExists = errors.New("bucket already exists")
 
-	// ErrBucketNameRequired is returned when creating a bucket with a blank name.
+	// ErrBucketNameRequired 当创建空名称存储桶时返回
 	ErrBucketNameRequired = errors.New("bucket name required")
 
-	// ErrKeyRequired is returned when inserting a zero-length key.
+	// ErrKeyRequired 当插入零长度键时返回
 	ErrKeyRequired = errors.New("key required")
 
-	// ErrKeyTooLarge is returned when inserting a key that is larger than MaxKeySize.
+	// ErrKeyTooLarge 当插入大于 MaxKeySize 的键时返回
 	ErrKeyTooLarge = errors.New("key too large")
 
-	// ErrValueTooLarge is returned when inserting a value that is larger than MaxValueSize.
+	// ErrValueTooLarge 当插入大于 MaxValueSize 的值时返回
 	ErrValueTooLarge = errors.New("value too large")
 
-	// ErrIncompatibleValue is returned when trying create or delete a bucket
-	// on an existing non-bucket key or when trying to create or delete a
-	// non-bucket key on an existing bucket key.
+	// ErrIncompatibleValue 当尝试在现有非存储桶键上创建或删除存储桶，
+	// 或在现有存储桶键上创建或删除非存储桶键时返回
 	ErrIncompatibleValue = errors.New("incompatible value")
 )

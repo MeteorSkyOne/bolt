@@ -35,7 +35,7 @@ type page struct {
 	ptr      uintptr
 }
 
-// typ returns a human readable page type string used for debugging.
+// typ 返回用于调试的可读页面类型字符串
 func (p *page) typ() string {
 	if (p.flags & branchPageFlag) != 0 {
 		return "branch"
@@ -49,18 +49,18 @@ func (p *page) typ() string {
 	return fmt.Sprintf("unknown<%02x>", p.flags)
 }
 
-// meta returns a pointer to the metadata section of the page.
+// meta 返回指向页面元数据部分的指针
 func (p *page) meta() *meta {
 	return (*meta)(unsafe.Pointer(&p.ptr))
 }
 
-// leafPageElement retrieves the leaf node by index
+// leafPageElement 通过索引检索叶节点
 func (p *page) leafPageElement(index uint16) *leafPageElement {
 	n := &((*[0x7FFFFFF]leafPageElement)(unsafe.Pointer(&p.ptr)))[index]
 	return n
 }
 
-// leafPageElements retrieves a list of leaf nodes.
+// leafPageElements 检索叶节点列表
 func (p *page) leafPageElements() []leafPageElement {
 	if p.count == 0 {
 		return nil
@@ -68,12 +68,12 @@ func (p *page) leafPageElements() []leafPageElement {
 	return ((*[0x7FFFFFF]leafPageElement)(unsafe.Pointer(&p.ptr)))[:]
 }
 
-// branchPageElement retrieves the branch node by index
+// branchPageElement 通过索引检索分支节点
 func (p *page) branchPageElement(index uint16) *branchPageElement {
 	return &((*[0x7FFFFFF]branchPageElement)(unsafe.Pointer(&p.ptr)))[index]
 }
 
-// branchPageElements retrieves a list of branch nodes.
+// branchPageElements 检索分支节点列表
 func (p *page) branchPageElements() []branchPageElement {
 	if p.count == 0 {
 		return nil
@@ -81,7 +81,7 @@ func (p *page) branchPageElements() []branchPageElement {
 	return ((*[0x7FFFFFF]branchPageElement)(unsafe.Pointer(&p.ptr)))[:]
 }
 
-// dump writes n bytes of the page to STDERR as hex output.
+// hexdump 将页面的 n 个字节作为十六进制输出写入 STDERR
 func (p *page) hexdump(n int) {
 	buf := (*[maxAllocSize]byte)(unsafe.Pointer(p))[:n]
 	fmt.Fprintf(os.Stderr, "%x\n", buf)
@@ -93,20 +93,20 @@ func (s pages) Len() int           { return len(s) }
 func (s pages) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 func (s pages) Less(i, j int) bool { return s[i].id < s[j].id }
 
-// branchPageElement represents a node on a branch page.
+// branchPageElement 表示分支页上的节点
 type branchPageElement struct {
 	pos   uint32
 	ksize uint32
 	pgid  pgid
 }
 
-// key returns a byte slice of the node key.
+// key 返回节点键的字节切片
 func (n *branchPageElement) key() []byte {
 	buf := (*[maxAllocSize]byte)(unsafe.Pointer(n))
 	return (*[maxAllocSize]byte)(unsafe.Pointer(&buf[n.pos]))[:n.ksize]
 }
 
-// leafPageElement represents a node on a leaf page.
+// leafPageElement 表示叶页上的节点
 type leafPageElement struct {
 	flags uint32
 	pos   uint32
@@ -114,19 +114,19 @@ type leafPageElement struct {
 	vsize uint32
 }
 
-// key returns a byte slice of the node key.
+// key 返回节点键的字节切片
 func (n *leafPageElement) key() []byte {
 	buf := (*[maxAllocSize]byte)(unsafe.Pointer(n))
 	return (*[maxAllocSize]byte)(unsafe.Pointer(&buf[n.pos]))[:n.ksize:n.ksize]
 }
 
-// value returns a byte slice of the node value.
+// value 返回节点值的字节切片
 func (n *leafPageElement) value() []byte {
 	buf := (*[maxAllocSize]byte)(unsafe.Pointer(n))
 	return (*[maxAllocSize]byte)(unsafe.Pointer(&buf[n.pos+n.ksize]))[:n.vsize:n.vsize]
 }
 
-// PageInfo represents human readable information about a page.
+// PageInfo 表示关于页面的可读信息
 type PageInfo struct {
 	ID            int
 	Type          string
@@ -140,9 +140,9 @@ func (s pgids) Len() int           { return len(s) }
 func (s pgids) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 func (s pgids) Less(i, j int) bool { return s[i] < s[j] }
 
-// merge returns the sorted union of a and b.
+// merge 返回 a 和 b 的排序并集
 func (a pgids) merge(b pgids) pgids {
-	// Return the opposite slice if one is nil.
+	// 如果其中一个为 nil 则返回另一个切片
 	if len(a) == 0 {
 		return b
 	}
@@ -154,13 +154,13 @@ func (a pgids) merge(b pgids) pgids {
 	return merged
 }
 
-// mergepgids copies the sorted union of a and b into dst.
-// If dst is too small, it panics.
+// mergepgids 将 a 和 b 的排序并集复制到 dst 中
+// 如果 dst 太小，会触发 panic
 func mergepgids(dst, a, b pgids) {
 	if len(dst) < len(a)+len(b) {
 		panic(fmt.Errorf("mergepgids bad len %d < %d + %d", len(dst), len(a), len(b)))
 	}
-	// Copy in the opposite slice if one is nil.
+	// 如果其中一个为 nil 则复制另一个切片
 	if len(a) == 0 {
 		copy(dst, b)
 		return
@@ -170,28 +170,28 @@ func mergepgids(dst, a, b pgids) {
 		return
 	}
 
-	// Merged will hold all elements from both lists.
+	// merged 将保存两个列表中的所有元素
 	merged := dst[:0]
 
-	// Assign lead to the slice with a lower starting value, follow to the higher value.
+	// 将 lead 分配给起始值较低的切片，follow 分配给较高值的切片
 	lead, follow := a, b
 	if b[0] < a[0] {
 		lead, follow = b, a
 	}
 
-	// Continue while there are elements in the lead.
+	// 当 lead 中还有元素时继续
 	for len(lead) > 0 {
-		// Merge largest prefix of lead that is ahead of follow[0].
+		// 合并 lead 中领先于 follow[0] 的最大前缀
 		n := sort.Search(len(lead), func(i int) bool { return lead[i] > follow[0] })
 		merged = append(merged, lead[:n]...)
 		if n >= len(lead) {
 			break
 		}
 
-		// Swap lead and follow.
+		// 交换 lead 和 follow
 		lead, follow = follow, lead[n:]
 	}
 
-	// Append what's left in follow.
+	// 追加 follow 中剩余的元素
 	_ = append(merged, follow...)
 }

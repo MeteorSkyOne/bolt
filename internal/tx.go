@@ -10,17 +10,16 @@ import (
 	"unsafe"
 )
 
-// txid represents the internal transaction identifier.
+// txid 表示内部事务标识符
 type txid uint64
 
-// Tx represents a read-only or read/write transaction on the database.
-// Read-only transactions can be used for retrieving values for keys and creating cursors.
-// Read/write transactions can create and remove buckets and create and remove keys.
+// Tx 表示数据库上的只读或读写事务
+// 只读事务可用于检索键值和创建游标
+// 读写事务可以创建和删除存储桶以及创建和删除键
 //
-// IMPORTANT: You must commit or rollback transactions when you are done with
-// them. Pages can not be reclaimed by the writer until no more transactions
-// are using them. A long running read transaction can cause the database to
-// quickly grow.
+// 重要提示：完成事务后必须提交或回滚事务
+// 在没有更多事务使用页面之前，写入器无法回收页面
+// 长时间运行的读事务可能导致数据库快速增长
 type Tx struct {
 	writable       bool
 	managed        bool
@@ -31,30 +30,29 @@ type Tx struct {
 	stats          TxStats
 	commitHandlers []func()
 
-	// WriteFlag specifies the flag for write-related methods like WriteTo().
-	// Tx opens the database file with the specified flag to copy the data.
+	// WriteFlag 指定写相关方法（如 WriteTo()）的标志
+	// Tx 使用指定的标志打开数据库文件来复制数据
 	//
-	// By default, the flag is unset, which works well for mostly in-memory
-	// workloads. For databases that are much larger than available RAM,
-	// set the flag to syscall.O_DIRECT to avoid trashing the page cache.
+	// 默认情况下，标志未设置，这对于主要在内存中的工作负载效果很好
+	// 对于比可用 RAM 大得多的数据库，将标志设置为 syscall.O_DIRECT 以避免破坏页面缓存
 	WriteFlag int
 }
 
-// init initializes the transaction.
+// init 初始化事务
 func (tx *Tx) init(db *DB) {
 	tx.db = db
 	tx.pages = nil
 
-	// Copy the meta page since it can be changed by the writer.
+	// 复制元页面，因为它可能被写入器更改
 	tx.meta = &meta{}
 	db.meta().copy(tx.meta)
 
-	// Copy over the root bucket.
+	// 复制根存储桶
 	tx.root = newBucket(tx)
 	tx.root.bucket = &bucket{}
 	*tx.root.bucket = tx.meta.root
 
-	// Increment the transaction id and add a page cache for writable transactions.
+	// 递增事务ID并为可写事务添加页面缓存
 	if tx.writable {
 		tx.pages = make(map[pgid]*page)
 
@@ -83,69 +81,67 @@ func (tx *Tx) init(db *DB) {
 	}
 }
 
-// ID returns the transaction id.
+// ID 返回事务ID
 func (tx *Tx) ID() int {
 	return int(tx.meta.txid)
 }
 
-// DB returns a reference to the database that created the transaction.
+// DB 返回创建事务的数据库引用
 func (tx *Tx) DB() *DB {
 	return tx.db
 }
 
-// Size returns current database size in bytes as seen by this transaction.
+// Size 返回此事务看到的当前数据库大小（字节）
 func (tx *Tx) Size() int64 {
 	return int64(tx.meta.pgid) * int64(tx.db.pageSize)
 }
 
-// Writable returns whether the transaction can perform write operations.
+// Writable 返回事务是否可以执行写操作
 func (tx *Tx) Writable() bool {
 	return tx.writable
 }
 
-// Cursor creates a cursor associated with the root bucket.
-// All items in the cursor will return a nil value because all root bucket keys point to buckets.
-// The cursor is only valid as long as the transaction is open.
-// Do not use a cursor after the transaction is closed.
+// Cursor 创建与根存储桶关联的游标
+// 游标中的所有项目都将返回nil值，因为所有根存储桶键都指向存储桶
+// 游标仅在事务打开时有效，事务关闭后不要使用游标
 func (tx *Tx) Cursor() *Cursor {
 	return tx.root.Cursor()
 }
 
-// Stats retrieves a copy of the current transaction statistics.
+// Stats 检索当前事务统计信息的副本
 func (tx *Tx) Stats() TxStats {
 	return tx.stats
 }
 
-// Bucket retrieves a bucket by name.
-// Returns nil if the bucket does not exist.
-// The bucket instance is only valid for the lifetime of the transaction.
+// Bucket 按名称检索存储桶
+// 如果存储桶不存在则返回nil
+// 存储桶实例仅在事务生命周期内有效
 func (tx *Tx) Bucket(name []byte) *Bucket {
 	return tx.root.Bucket(name)
 }
 
-// CreateBucket creates a new bucket.
-// Returns an error if the bucket already exists, if the bucket name is blank, or if the bucket name is too long.
-// The bucket instance is only valid for the lifetime of the transaction.
+// CreateBucket 创建新存储桶
+// 如果存储桶已存在、存储桶名称为空或存储桶名称过长，则返回错误
+// 存储桶实例仅在事务生命周期内有效
 func (tx *Tx) CreateBucket(name []byte) (*Bucket, error) {
 	return tx.root.CreateBucket(name)
 }
 
-// CreateBucketIfNotExists creates a new bucket if it doesn't already exist.
-// Returns an error if the bucket name is blank, or if the bucket name is too long.
-// The bucket instance is only valid for the lifetime of the transaction.
+// CreateBucketIfNotExists 如果存储桶不存在则创建新存储桶
+// 如果存储桶名称为空或存储桶名称过长，则返回错误
+// 存储桶实例仅在事务生命周期内有效
 func (tx *Tx) CreateBucketIfNotExists(name []byte) (*Bucket, error) {
 	return tx.root.CreateBucketIfNotExists(name)
 }
 
-// DeleteBucket deletes a bucket.
-// Returns an error if the bucket cannot be found or if the key represents a non-bucket value.
+// DeleteBucket 删除存储桶
+// 如果找不到存储桶或键表示非存储桶值，则返回错误
 func (tx *Tx) DeleteBucket(name []byte) error {
 	return tx.root.DeleteBucket(name)
 }
 
-// ForEach executes a function for each bucket in the root.
-// If the provided function returns an error then the iteration is stopped and
-// the error is returned to the caller.
+// ForEach 为根中的每个存储桶执行函数
+// 如果提供的函数返回错误，则停止迭代并将错误返回给调用者
 func (tx *Tx) ForEach(fn func(name []byte, b *Bucket) error) error {
 	return tx.root.ForEach(func(k, v []byte) error {
 		if err := fn(k, tx.root.Bucket(k)); err != nil {
@@ -155,14 +151,13 @@ func (tx *Tx) ForEach(fn func(name []byte, b *Bucket) error) error {
 	})
 }
 
-// OnCommit adds a handler function to be executed after the transaction successfully commits.
+// OnCommit 添加在事务成功提交后执行的处理函数
 func (tx *Tx) OnCommit(fn func()) {
 	tx.commitHandlers = append(tx.commitHandlers, fn)
 }
 
-// Commit writes all changes to disk and updates the meta page.
-// Returns an error if a disk write error occurs, or if Commit is
-// called on a read-only transaction.
+// Commit 将所有更改写入磁盘并更新元页面
+// 如果发生磁盘写入错误或在只读事务上调用Commit，则返回错误
 func (tx *Tx) Commit() error {
 	_assert(!tx.managed, "managed tx commit not allowed")
 	if tx.db == nil {
@@ -171,16 +166,16 @@ func (tx *Tx) Commit() error {
 		return ErrTxNotWritable
 	}
 
-	// TODO(benbjohnson): Use vectorized I/O to write out dirty pages.
+	// TODO(benbjohnson): 使用向量化I/O写出脏页面
 
-	// Rebalance nodes which have had deletions.
+	// 重新平衡已删除的节点
 	var startTime = time.Now()
 	tx.root.rebalance()
 	if tx.stats.Rebalance > 0 {
 		tx.stats.RebalanceTime += time.Since(startTime)
 	}
 
-	// spill data onto dirty pages.
+	// 将数据溢出到脏页面
 	startTime = time.Now()
 	if err := tx.root.spill(); err != nil {
 		tx.rollback()
@@ -188,13 +183,13 @@ func (tx *Tx) Commit() error {
 	}
 	tx.stats.SpillTime += time.Since(startTime)
 
-	// Free the old root bucket.
+	// 释放旧的根存储桶
 	tx.meta.root.root = tx.root.root
 
 	opgid := tx.meta.pgid
 
-	// Free the freelist and allocate new pages for it. This will overestimate
-	// the size of the freelist but not underestimate the size (which would be bad).
+	// 释放空闲列表并为其分配新页面
+	// 这会高估空闲列表的大小但不会低估大小（这会很糟糕）
 	tx.db.freelist.free(tx.meta.txid, tx.db.page(tx.meta.freelist))
 	p, err := tx.allocate((tx.db.freelist.size() / tx.db.pageSize) + 1)
 	if err != nil {
@@ -207,7 +202,7 @@ func (tx *Tx) Commit() error {
 	}
 	tx.meta.freelist = p.id
 
-	// If the high water mark has moved up then attempt to grow the database.
+	// 如果高水位标记上移，则尝试增长数据库
 	if tx.meta.pgid > opgid {
 		if err := tx.db.grow(int(tx.meta.pgid+1) * tx.db.pageSize); err != nil {
 			tx.rollback()
@@ -215,15 +210,15 @@ func (tx *Tx) Commit() error {
 		}
 	}
 
-	// Write dirty pages to disk.
+	// 将脏页面写入磁盘
 	startTime = time.Now()
 	if err := tx.write(); err != nil {
 		tx.rollback()
 		return err
 	}
 
-	// If strict mode is enabled then perform a consistency check.
-	// Only the first consistency error is reported in the panic.
+	// 如果启用严格模式，则执行一致性检查
+	// 只有第一个一致性错误会在panic中报告
 	if tx.db.StrictMode {
 		ch := tx.Check()
 		var errs []string
@@ -239,17 +234,17 @@ func (tx *Tx) Commit() error {
 		}
 	}
 
-	// Write meta to disk.
+	// 将元数据写入磁盘
 	if err := tx.writeMeta(); err != nil {
 		tx.rollback()
 		return err
 	}
 	tx.stats.WriteTime += time.Since(startTime)
 
-	// Finalize the transaction.
+	// 完成事务
 	tx.close()
 
-	// Execute commit handlers now that the locks have been removed.
+	// 现在锁已被移除，执行提交处理程序
 	for _, fn := range tx.commitHandlers {
 		fn()
 	}
@@ -257,8 +252,8 @@ func (tx *Tx) Commit() error {
 	return nil
 }
 
-// Rollback closes the transaction and ignores all previous updates. Read-only
-// transactions must be rolled back and not committed.
+// Rollback 关闭事务并忽略所有先前的更新
+// 只读事务必须回滚而不是提交
 func (tx *Tx) Rollback() error {
 	_assert(!tx.managed, "managed tx rollback not allowed")
 	if tx.db == nil {
@@ -284,16 +279,16 @@ func (tx *Tx) close() {
 		return
 	}
 	if tx.writable {
-		// Grab freelist stats.
+		// 获取空闲列表统计信息
 		var freelistFreeN = tx.db.freelist.free_count()
 		var freelistPendingN = tx.db.freelist.pending_count()
 		var freelistAlloc = tx.db.freelist.size()
 
-		// Remove transaction ref & writer lock.
+		// 移除事务引用和写锁
 		tx.db.rwtx = nil
 		tx.db.rwlock.Unlock()
 
-		// Merge statistics.
+		// 合并统计信息
 		tx.db.statlock.Lock()
 		tx.db.stats.FreePageN = freelistFreeN
 		tx.db.stats.PendingPageN = freelistPendingN
@@ -305,39 +300,39 @@ func (tx *Tx) close() {
 		tx.db.removeTx(tx)
 	}
 
-	// Clear all references.
+	// 清除所有引用
 	tx.db = nil
 	tx.meta = nil
 	tx.root = Bucket{tx: tx}
 	tx.pages = nil
 }
 
-// Copy writes the entire database to a writer.
-// This function exists for backwards compatibility.
+// Copy 将整个数据库写入写入器
+// 此函数为向后兼容而存在
 //
-// Deprecated; Use WriteTo() instead.
+// 已弃用；请使用 WriteTo()
 func (tx *Tx) Copy(w io.Writer) error {
 	_, err := tx.WriteTo(w)
 	return err
 }
 
-// WriteTo writes the entire database to a writer.
-// If err == nil then exactly tx.Size() bytes will be written into the writer.
+// WriteTo 将整个数据库写入写入器
+// 如果 err == nil，则恰好将 tx.Size() 字节写入写入器
 func (tx *Tx) WriteTo(w io.Writer) (n int64, err error) {
-	// Attempt to open reader with WriteFlag
+	// 尝试使用 WriteFlag 打开读取器
 	f, err := os.OpenFile(tx.db.path, os.O_RDONLY|tx.WriteFlag, 0)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = f.Close() }()
 
-	// Generate a meta page. We use the same page data for both meta pages.
+	// 生成元页面，两个元页面使用相同的页面数据
 	buf := make([]byte, tx.db.pageSize)
 	page := (*page)(unsafe.Pointer(&buf[0]))
 	page.flags = metaPageFlag
 	*page.meta() = *tx.meta
 
-	// Write meta 0.
+	// 写入元页面0
 	page.id = 0
 	page.meta().checksum = page.meta().sum64()
 	nn, err := w.Write(buf)
@@ -346,7 +341,7 @@ func (tx *Tx) WriteTo(w io.Writer) (n int64, err error) {
 		return n, fmt.Errorf("meta 0 copy: %s", err)
 	}
 
-	// Write meta 1 with a lower transaction id.
+	// 写入元页面1，使用较低的事务ID
 	page.id = 1
 	page.meta().txid -= 1
 	page.meta().checksum = page.meta().sum64()
@@ -356,12 +351,12 @@ func (tx *Tx) WriteTo(w io.Writer) (n int64, err error) {
 		return n, fmt.Errorf("meta 1 copy: %s", err)
 	}
 
-	// Move past the meta pages in the file.
+	// 跳过文件中的元页面
 	if _, err := f.Seek(int64(tx.db.pageSize*2), os.SEEK_SET); err != nil {
 		return n, fmt.Errorf("seek: %s", err)
 	}
 
-	// Copy data pages.
+	// 复制数据页面
 	wn, err := io.CopyN(w, f, tx.Size()-int64(tx.db.pageSize*2))
 	n += wn
 	if err != nil {
@@ -371,9 +366,8 @@ func (tx *Tx) WriteTo(w io.Writer) (n int64, err error) {
 	return n, f.Close()
 }
 
-// CopyFile copies the entire database to file at the given path.
-// A reader transaction is maintained during the copy so it is safe to continue
-// using the database while a copy is in progress.
+// CopyFile 将整个数据库复制到给定路径的文件
+// 在复制期间维护读取器事务，因此在复制进行时继续使用数据库是安全的
 func (tx *Tx) CopyFile(path string, mode os.FileMode) error {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
@@ -388,14 +382,12 @@ func (tx *Tx) CopyFile(path string, mode os.FileMode) error {
 	return f.Close()
 }
 
-// Check performs several consistency checks on the database for this transaction.
-// An error is returned if any inconsistency is found.
+// Check 对此事务的数据库执行多项一致性检查
+// 如果发现任何不一致，则返回错误
 //
-// It can be safely run concurrently on a writable transaction. However, this
-// incurs a high cost for large databases and databases with a lot of subbuckets
-// because of caching. This overhead can be removed if running on a read-only
-// transaction, however, it is not safe to execute other writer transactions at
-// the same time.
+// 可以在可写事务上安全地并发运行
+// 但是，对于大型数据库和具有大量子存储桶的数据库，由于缓存，这会产生高成本
+// 如果在只读事务上运行，可以消除此开销，但是同时执行其他写入器事务是不安全的
 func (tx *Tx) Check() <-chan error {
 	ch := make(chan error)
 	go tx.check(ch)
@@ -403,7 +395,7 @@ func (tx *Tx) Check() <-chan error {
 }
 
 func (tx *Tx) check(ch chan error) {
-	// Check if any pages are double freed.
+	// 检查是否有页面被双重释放
 	freed := make(map[pgid]bool)
 	all := make([]pgid, tx.db.freelist.count())
 	tx.db.freelist.copyall(all)
@@ -414,7 +406,7 @@ func (tx *Tx) check(ch chan error) {
 		freed[id] = true
 	}
 
-	// Track every reachable page.
+	// 跟踪每个可达页面
 	reachable := make(map[pgid]*page)
 	reachable[0] = tx.page(0) // meta0
 	reachable[1] = tx.page(1) // meta1
@@ -422,10 +414,10 @@ func (tx *Tx) check(ch chan error) {
 		reachable[tx.meta.freelist+pgid(i)] = tx.page(tx.meta.freelist)
 	}
 
-	// Recursively check buckets.
+	// 递归检查存储桶
 	tx.checkBucket(&tx.root, reachable, freed, ch)
 
-	// Ensure all pages below high water mark are either reachable or freed.
+	// 确保高水位标记以下的所有页面都是可达的或已释放的
 	for i := pgid(0); i < tx.meta.pgid; i++ {
 		_, isReachable := reachable[i]
 		if !isReachable && !freed[i] {
@@ -433,23 +425,23 @@ func (tx *Tx) check(ch chan error) {
 		}
 	}
 
-	// Close the channel to signal completion.
+	// 关闭通道以表示完成
 	close(ch)
 }
 
 func (tx *Tx) checkBucket(b *Bucket, reachable map[pgid]*page, freed map[pgid]bool, ch chan error) {
-	// Ignore inline buckets.
+	// 忽略内联存储桶
 	if b.root == 0 {
 		return
 	}
 
-	// Check every page used by this bucket.
+	// 检查此存储桶使用的每个页面
 	b.tx.forEachPage(b.root, 0, func(p *page, _ int) {
 		if p.id > tx.meta.pgid {
 			ch <- fmt.Errorf("page %d: out of bounds: %d", int(p.id), int(b.tx.meta.pgid))
 		}
 
-		// Ensure each page is only referenced once.
+		// 确保每个页面只被引用一次
 		for i := pgid(0); i <= pgid(p.overflow); i++ {
 			var id = p.id + i
 			if _, ok := reachable[id]; ok {
@@ -458,7 +450,7 @@ func (tx *Tx) checkBucket(b *Bucket, reachable map[pgid]*page, freed map[pgid]bo
 			reachable[id] = p
 		}
 
-		// We should only encounter un-freed leaf and branch pages.
+		// 我们应该只遇到未释放的叶子和分支页面
 		if freed[p.id] {
 			ch <- fmt.Errorf("page %d: reachable freed", int(p.id))
 		} else if (p.flags&branchPageFlag) == 0 && (p.flags&leafPageFlag) == 0 {
@@ -466,7 +458,7 @@ func (tx *Tx) checkBucket(b *Bucket, reachable map[pgid]*page, freed map[pgid]bo
 		}
 	})
 
-	// Check each bucket within this bucket.
+	// 检查此存储桶内的每个存储桶
 	_ = b.ForEach(func(k, v []byte) error {
 		if child := b.Bucket(k); child != nil {
 			tx.checkBucket(child, reachable, freed, ch)
@@ -475,87 +467,87 @@ func (tx *Tx) checkBucket(b *Bucket, reachable map[pgid]*page, freed map[pgid]bo
 	})
 }
 
-// allocate returns a contiguous block of memory starting at a given page.
+// allocate 返回从给定页面开始的连续内存块
 func (tx *Tx) allocate(count int) (*page, error) {
 	p, err := tx.db.allocate(count)
 	if err != nil {
 		return nil, err
 	}
 
-	// Save to our page cache.
+	// 保存到页面缓存
 	tx.pages[p.id] = p
 
-	// Update statistics.
+	// 更新统计信息
 	tx.stats.PageCount++
 	tx.stats.PageAlloc += count * tx.db.pageSize
 
 	return p, nil
 }
 
-// write writes any dirty pages to disk.
+// write 将任何脏页面写入磁盘
 func (tx *Tx) write() error {
-	// Sort pages by id.
+	// 按ID排序页面
 	pages := make(pages, 0, len(tx.pages))
 	for _, p := range tx.pages {
 		pages = append(pages, p)
 	}
-	// Clear out page cache early.
+	// 提前清除页面缓存
 	tx.pages = make(map[pgid]*page)
 	sort.Sort(pages)
 
-	// Write pages to disk in order.
+	// 按顺序将页面写入磁盘
 	for _, p := range pages {
 		size := (int(p.overflow) + 1) * tx.db.pageSize
 		offset := int64(p.id) * int64(tx.db.pageSize)
 
-		// Write out page in "max allocation" sized chunks.
+		// 以"最大分配"大小的块写出页面
 		ptr := (*[maxAllocSize]byte)(unsafe.Pointer(p))
 		for {
-			// Limit our write to our max allocation size.
+			// 将写入限制为最大分配大小
 			sz := size
 			if sz > maxAllocSize-1 {
 				sz = maxAllocSize - 1
 			}
 
-			// Write chunk to disk.
+			// 将块写入磁盘
 			buf := ptr[:sz]
 			if _, err := tx.db.ops.writeAt(buf, offset); err != nil {
 				return err
 			}
 
-			// Update statistics.
+			// 更新统计信息
 			tx.stats.Write++
 
-			// Exit inner for loop if we've written all the chunks.
+			// 如果已写入所有块，则退出内部循环
 			size -= sz
 			if size == 0 {
 				break
 			}
 
-			// Otherwise move offset forward and move pointer to next chunk.
+			// 否则向前移动偏移量并将指针移动到下一个块
 			offset += int64(sz)
 			ptr = (*[maxAllocSize]byte)(unsafe.Pointer(&ptr[sz]))
 		}
 	}
 
-	// Ignore file sync if flag is set on DB.
+	// 如果在DB上设置了标志，则忽略文件同步
 	if !tx.db.NoSync || IgnoreNoSync {
 		if err := fdatasync(tx.db); err != nil {
 			return err
 		}
 	}
 
-	// Put small pages back to page pool.
+	// 将小页面放回页面池
 	for _, p := range pages {
-		// Ignore page sizes over 1 page.
-		// These are allocated using make() instead of the page pool.
+		// 忽略超过1页的页面大小
+		// 这些是使用make()而不是页面池分配的
 		if int(p.overflow) != 0 {
 			continue
 		}
 
 		buf := (*[maxAllocSize]byte)(unsafe.Pointer(p))[:tx.db.pageSize]
 
-		// See https://go.googlesource.com/go/+/f03c9202c43e0abb130669852082117ca50aa9b1
+		// 参见 https://go.googlesource.com/go/+/f03c9202c43e0abb130669852082117ca50aa9b1
 		for i := range buf {
 			buf[i] = 0
 		}
@@ -565,14 +557,14 @@ func (tx *Tx) write() error {
 	return nil
 }
 
-// writeMeta writes the meta to the disk.
+// writeMeta 将元数据写入磁盘
 func (tx *Tx) writeMeta() error {
-	// Create a temporary buffer for the meta page.
+	// 为元页面创建临时缓冲区
 	buf := make([]byte, tx.db.pageSize)
 	p := tx.db.pageInBuffer(buf, 0)
 	tx.meta.write(p)
 
-	// Write the meta page to file.
+	// 将元页面写入文件
 	if _, err := tx.db.ops.writeAt(buf, int64(p.id)*int64(tx.db.pageSize)); err != nil {
 		return err
 	}
@@ -582,34 +574,34 @@ func (tx *Tx) writeMeta() error {
 		}
 	}
 
-	// Update statistics.
+	// 更新统计信息
 	tx.stats.Write++
 
 	return nil
 }
 
-// page returns a reference to the page with a given id.
-// If page has been written to then a temporary buffered page is returned.
+// page 返回具有给定ID的页面的引用
+// 如果页面已被写入，则返回临时缓冲页面
 func (tx *Tx) page(id pgid) *page {
-	// Check the dirty pages first.
+	// 首先检查脏页面
 	if tx.pages != nil {
 		if p, ok := tx.pages[id]; ok {
 			return p
 		}
 	}
 
-	// Otherwise return directly from the mmap.
+	// 否则直接从mmap返回
 	return tx.db.page(id)
 }
 
-// forEachPage iterates over every page within a given page and executes a function.
+// forEachPage 遍历给定页面内的每个页面并执行函数
 func (tx *Tx) forEachPage(pgid pgid, depth int, fn func(*page, int)) {
 	p := tx.page(pgid)
 
-	// Execute function.
+	// 执行函数
 	fn(p, depth)
 
-	// Recursively loop over children.
+	// 递归遍历子节点
 	if (p.flags & branchPageFlag) != 0 {
 		for i := 0; i < int(p.count); i++ {
 			elem := p.branchPageElement(uint16(i))
@@ -618,8 +610,8 @@ func (tx *Tx) forEachPage(pgid pgid, depth int, fn func(*page, int)) {
 	}
 }
 
-// Page returns page information for a given page number.
-// This is only safe for concurrent use when used by a writable transaction.
+// Page 返回给定页面号的页面信息
+// 仅在可写事务使用时才能安全并发使用
 func (tx *Tx) Page(id int) (*PageInfo, error) {
 	if tx.db == nil {
 		return nil, ErrTxClosed
@@ -627,7 +619,7 @@ func (tx *Tx) Page(id int) (*PageInfo, error) {
 		return nil, nil
 	}
 
-	// Build the page info.
+	// 构建页面信息
 	p := tx.db.page(pgid(id))
 	info := &PageInfo{
 		ID:            id,
@@ -635,7 +627,7 @@ func (tx *Tx) Page(id int) (*PageInfo, error) {
 		OverflowCount: int(p.overflow),
 	}
 
-	// Determine the type (or if it's free).
+	// 确定类型（或是否空闲）
 	if tx.db.freelist.freed(pgid(id)) {
 		info.Type = "free"
 	} else {
@@ -645,31 +637,31 @@ func (tx *Tx) Page(id int) (*PageInfo, error) {
 	return info, nil
 }
 
-// TxStats represents statistics about the actions performed by the transaction.
+// TxStats 表示事务执行的操作统计信息
 type TxStats struct {
-	// Page statistics.
-	PageCount int // number of page allocations
-	PageAlloc int // total bytes allocated
+	// 页面统计
+	PageCount int // 页面分配数量
+	PageAlloc int // 分配的总字节数
 
-	// Cursor statistics.
-	CursorCount int // number of cursors created
+	// 游标统计
+	CursorCount int // 创建的游标数量
 
-	// Node statistics
-	NodeCount int // number of node allocations
-	NodeDeref int // number of node dereferences
+	// 节点统计
+	NodeCount int // 节点分配数量
+	NodeDeref int // 节点解引用数量
 
-	// Rebalance statistics.
-	Rebalance     int           // number of node rebalances
-	RebalanceTime time.Duration // total time spent rebalancing
+	// 重平衡统计
+	Rebalance     int           // 节点重平衡数量
+	RebalanceTime time.Duration // 重平衡总时间
 
-	// Split/Spill statistics.
-	Split     int           // number of nodes split
-	Spill     int           // number of nodes spilled
-	SpillTime time.Duration // total time spent spilling
+	// 分割/溢出统计
+	Split     int           // 节点分割数量
+	Spill     int           // 节点溢出数量
+	SpillTime time.Duration // 溢出总时间
 
-	// Write statistics.
-	Write     int           // number of writes performed
-	WriteTime time.Duration // total time spent writing to disk
+	// 写入统计
+	Write     int           // 执行的写入数量
+	WriteTime time.Duration // 写入磁盘的总时间
 }
 
 func (s *TxStats) add(other *TxStats) {
@@ -687,9 +679,8 @@ func (s *TxStats) add(other *TxStats) {
 	s.WriteTime += other.WriteTime
 }
 
-// Sub calculates and returns the difference between two sets of transaction stats.
-// This is useful when obtaining stats at two different points and time and
-// you need the performance counters that occurred within that time span.
+// Sub 计算并返回两组事务统计信息之间的差异
+// 当在两个不同时间点获取统计信息时很有用，您需要在该时间跨度内发生的性能计数器
 func (s *TxStats) Sub(other *TxStats) TxStats {
 	var diff TxStats
 	diff.PageCount = s.PageCount - other.PageCount

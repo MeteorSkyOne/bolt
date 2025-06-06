@@ -7,10 +7,10 @@ import (
 )
 
 const (
-	// MaxKeySize is the maximum length of a key, in bytes.
+	// MaxKeySize 是键的最大长度，以字节为单位
 	MaxKeySize = 32768
 
-	// MaxValueSize is the maximum length of a value, in bytes.
+	// MaxValueSize 是值的最大长度，以字节为单位
 	MaxValueSize = (1 << 31) - 2
 )
 
@@ -28,37 +28,37 @@ const (
 	maxFillPercent = 1.0
 )
 
-// DefaultFillPercent is the percentage that split pages are filled.
-// This value can be changed by setting Bucket.FillPercent.
+// DefaultFillPercent 是分裂页面的填充百分比
+// 这个值可以通过设置 Bucket.FillPercent 来改变
 const DefaultFillPercent = 0.5
 
-// Bucket represents a collection of key/value pairs inside the database.
+// Bucket 表示数据库内部键值对的集合
 type Bucket struct {
 	*bucket
-	tx       *Tx                // the associated transaction
-	buckets  map[string]*Bucket // subbucket cache
-	page     *page              // inline page reference
-	rootNode *node              // materialized node for the root page.
-	nodes    map[pgid]*node     // node cache
+	tx       *Tx                // 关联的事务
+	buckets  map[string]*Bucket // 子桶缓存
+	page     *page              // 内联页面引用
+	rootNode *node              // 根页面的物化节点
+	nodes    map[pgid]*node     // 节点缓存
 
-	// Sets the threshold for filling nodes when they split. By default,
-	// the bucket will fill to 50% but it can be useful to increase this
-	// amount if you know that your write workloads are mostly append-only.
+	// 设置节点分裂时的填充阈值。默认情况下，
+	// 桶会填充到50%，但如果你知道你的写入工作负载主要是追加操作，
+	// 增加这个值会很有用。
 	//
-	// This is non-persisted across transactions so it must be set in every Tx.
+	// 这个值不会在事务间持久化，所以必须在每个事务中设置。
 	FillPercent float64
 }
 
-// bucket represents the on-file representation of a bucket.
-// This is stored as the "value" of a bucket key. If the bucket is small enough,
-// then its root page can be stored inline in the "value", after the bucket
-// header. In the case of inline buckets, the "root" will be 0.
+// bucket 表示桶的文件存储表示
+// 这作为桶键的"值"存储。如果桶足够小，
+// 那么它的根页面可以在桶头部之后内联存储在"值"中。
+// 对于内联桶，"root"将为0。
 type bucket struct {
-	root     pgid   // page id of the bucket's root-level page
-	sequence uint64 // monotonically incrementing, used by NextSequence()
+	root     pgid   // 桶根级页面的页面ID
+	sequence uint64 // 单调递增，由NextSequence()使用
 }
 
-// newBucket returns a new bucket associated with a transaction.
+// newBucket 返回一个与事务关联的新桶
 func newBucket(tx *Tx) Bucket {
 	var b = Bucket{tx: tx, FillPercent: DefaultFillPercent}
 	if tx.writable {
@@ -68,38 +68,38 @@ func newBucket(tx *Tx) Bucket {
 	return b
 }
 
-// Tx returns the tx of the bucket.
+// Tx 返回桶的事务
 func (b *Bucket) Tx() *Tx {
 	return b.tx
 }
 
-// Root returns the root of the bucket.
+// Root 返回桶的根
 func (b *Bucket) Root() pgid {
 	return b.root
 }
 
-// Writable returns whether the bucket is writable.
+// Writable 返回桶是否可写
 func (b *Bucket) Writable() bool {
 	return b.tx.writable
 }
 
-// Cursor creates a cursor associated with the bucket.
-// The cursor is only valid as long as the transaction is open.
-// Do not use a cursor after the transaction is closed.
+// Cursor 创建一个与桶关联的游标
+// 游标只在事务打开期间有效
+// 事务关闭后不要使用游标
 func (b *Bucket) Cursor() *Cursor {
-	// Update transaction statistics.
+	// 更新事务统计
 	b.tx.stats.CursorCount++
 
-	// Allocate and return a cursor.
+	// 分配并返回游标
 	return &Cursor{
 		bucket: b,
 		stack:  make([]elemRef, 0),
 	}
 }
 
-// Bucket retrieves a nested bucket by name.
-// Returns nil if the bucket does not exist.
-// The bucket instance is only valid for the lifetime of the transaction.
+// Bucket 通过名称检索嵌套桶
+// 如果桶不存在则返回nil
+// 桶实例只在事务生命周期内有效
 func (b *Bucket) Bucket(name []byte) *Bucket {
 	if b.buckets != nil {
 		if child := b.buckets[string(name)]; child != nil {
@@ -107,16 +107,16 @@ func (b *Bucket) Bucket(name []byte) *Bucket {
 		}
 	}
 
-	// Move cursor to key.
+	// 移动游标到键
 	c := b.Cursor()
 	k, v, flags := c.seek(name)
 
-	// Return nil if the key doesn't exist or it is not a bucket.
+	// 如果键不存在或不是桶则返回nil
 	if !bytes.Equal(name, k) || (flags&bucketLeafFlag) == 0 {
 		return nil
 	}
 
-	// Otherwise create a bucket and cache it.
+	// 否则创建桶并缓存它
 	var child = b.openBucket(v)
 	if b.buckets != nil {
 		b.buckets[string(name)] = child
@@ -125,21 +125,20 @@ func (b *Bucket) Bucket(name []byte) *Bucket {
 	return child
 }
 
-// Helper method that re-interprets a sub-bucket value
-// from a parent into a Bucket
+// 辅助方法，将父桶中的子桶值重新解释为Bucket
 func (b *Bucket) openBucket(value []byte) *Bucket {
 	var child = newBucket(b.tx)
 
-	// If unaligned load/stores are broken on this arch and value is
-	// unaligned simply clone to an aligned byte array.
+	// 如果在此架构上未对齐的加载/存储被破坏且值未对齐，
+	// 则简单地克隆到对齐的字节数组
 	unaligned := brokenUnaligned && uintptr(unsafe.Pointer(&value[0]))&3 != 0
 
 	if unaligned {
 		value = cloneBytes(value)
 	}
 
-	// If this is a writable transaction then we need to copy the bucket entry.
-	// Read-only transactions can point directly at the mmap entry.
+	// 如果这是可写事务，则需要复制桶条目
+	// 只读事务可以直接指向mmap条目
 	if b.tx.writable && !unaligned {
 		child.bucket = &bucket{}
 		*child.bucket = *(*bucket)(unsafe.Pointer(&value[0]))
@@ -147,7 +146,7 @@ func (b *Bucket) openBucket(value []byte) *Bucket {
 		child.bucket = (*bucket)(unsafe.Pointer(&value[0]))
 	}
 
-	// Save a reference to the inline page if the bucket is inline.
+	// 如果桶是内联的，保存对内联页面的引用
 	if child.root == 0 {
 		child.page = (*page)(unsafe.Pointer(&value[bucketHeaderSize]))
 	}
@@ -155,9 +154,9 @@ func (b *Bucket) openBucket(value []byte) *Bucket {
 	return &child
 }
 
-// CreateBucket creates a new bucket at the given key and returns the new bucket.
-// Returns an error if the key already exists, if the bucket name is blank, or if the bucket name is too long.
-// The bucket instance is only valid for the lifetime of the transaction.
+// CreateBucket 在给定键处创建新桶并返回新桶
+// 如果键已存在、桶名为空或桶名太长则返回错误
+// 桶实例只在事务生命周期内有效
 func (b *Bucket) CreateBucket(key []byte) (*Bucket, error) {
 	if b.tx.db == nil {
 		return nil, ErrTxClosed
@@ -167,11 +166,11 @@ func (b *Bucket) CreateBucket(key []byte) (*Bucket, error) {
 		return nil, ErrBucketNameRequired
 	}
 
-	// Move cursor to correct position.
+	// 移动游标到正确位置
 	c := b.Cursor()
 	k, _, flags := c.seek(key)
 
-	// Return an error if there is an existing key.
+	// 如果存在现有键则返回错误
 	if bytes.Equal(key, k) {
 		if (flags & bucketLeafFlag) != 0 {
 			return nil, ErrBucketExists
@@ -179,7 +178,7 @@ func (b *Bucket) CreateBucket(key []byte) (*Bucket, error) {
 		return nil, ErrIncompatibleValue
 	}
 
-	// Create empty, inline bucket.
+	// 创建空的内联桶
 	var bucket = Bucket{
 		bucket:      &bucket{},
 		rootNode:    &node{isLeaf: true},
@@ -187,21 +186,20 @@ func (b *Bucket) CreateBucket(key []byte) (*Bucket, error) {
 	}
 	var value = bucket.write()
 
-	// Insert into node.
+	// 插入到节点
 	key = cloneBytes(key)
 	c.node().put(key, key, value, 0, bucketLeafFlag)
 
-	// Since subbuckets are not allowed on inline buckets, we need to
-	// dereference the inline page, if it exists. This will cause the bucket
-	// to be treated as a regular, non-inline bucket for the rest of the tx.
+	// 由于内联桶不允许子桶，我们需要取消引用内联页面（如果存在）
+	// 这将导致桶在事务的其余部分被视为常规的非内联桶
 	b.page = nil
 
 	return b.Bucket(key), nil
 }
 
-// CreateBucketIfNotExists creates a new bucket if it doesn't already exist and returns a reference to it.
-// Returns an error if the bucket name is blank, or if the bucket name is too long.
-// The bucket instance is only valid for the lifetime of the transaction.
+// CreateBucketIfNotExists 如果桶不存在则创建新桶并返回引用
+// 如果桶名为空或桶名太长则返回错误
+// 桶实例只在事务生命周期内有效
 func (b *Bucket) CreateBucketIfNotExists(key []byte) (*Bucket, error) {
 	child, err := b.CreateBucket(key)
 	if err == ErrBucketExists {
@@ -212,8 +210,8 @@ func (b *Bucket) CreateBucketIfNotExists(key []byte) (*Bucket, error) {
 	return child, nil
 }
 
-// DeleteBucket deletes a bucket at the given key.
-// Returns an error if the bucket does not exists, or if the key represents a non-bucket value.
+// DeleteBucket 删除给定键处的桶
+// 如果桶不存在或键表示非桶值则返回错误
 func (b *Bucket) DeleteBucket(key []byte) error {
 	if b.tx.db == nil {
 		return ErrTxClosed
@@ -221,18 +219,18 @@ func (b *Bucket) DeleteBucket(key []byte) error {
 		return ErrTxNotWritable
 	}
 
-	// Move cursor to correct position.
+	// 移动游标到正确位置
 	c := b.Cursor()
 	k, _, flags := c.seek(key)
 
-	// Return an error if bucket doesn't exist or is not a bucket.
+	// 如果桶不存在或不是桶则返回错误
 	if !bytes.Equal(key, k) {
 		return ErrBucketNotFound
 	} else if (flags & bucketLeafFlag) == 0 {
 		return ErrIncompatibleValue
 	}
 
-	// Recursively delete all child buckets.
+	// 递归删除所有子桶
 	child := b.Bucket(key)
 	err := child.ForEach(func(k, v []byte) error {
 		if v == nil {
@@ -246,42 +244,42 @@ func (b *Bucket) DeleteBucket(key []byte) error {
 		return err
 	}
 
-	// Remove cached copy.
+	// 移除缓存副本
 	delete(b.buckets, string(key))
 
-	// Release all bucket pages to freelist.
+	// 释放所有桶页面到空闲列表
 	child.nodes = nil
 	child.rootNode = nil
 	child.free()
 
-	// Delete the node if we have a matching key.
+	// 如果有匹配的键则删除节点
 	c.node().del(key)
 
 	return nil
 }
 
-// Get retrieves the value for a key in the bucket.
-// Returns a nil value if the key does not exist or if the key is a nested bucket.
-// The returned value is only valid for the life of the transaction.
+// Get 检索桶中键的值
+// 如果键不存在或键是嵌套桶则返回nil值
+// 返回的值只在事务生命周期内有效
 func (b *Bucket) Get(key []byte) []byte {
 	k, v, flags := b.Cursor().seek(key)
 
-	// Return nil if this is a bucket.
+	// 如果这是桶则返回nil
 	if (flags & bucketLeafFlag) != 0 {
 		return nil
 	}
 
-	// If our target node isn't the same key as what's passed in then return nil.
+	// 如果目标节点与传入的键不同则返回nil
 	if !bytes.Equal(key, k) {
 		return nil
 	}
 	return v
 }
 
-// Put sets the value for a key in the bucket.
-// If the key exist then its previous value will be overwritten.
-// Supplied value must remain valid for the life of the transaction.
-// Returns an error if the bucket was created from a read-only transaction, if the key is blank, if the key is too large, or if the value is too large.
+// Put 在桶中设置键的值
+// 如果键存在则其先前值将被覆盖
+// 提供的值必须在事务生命周期内保持有效
+// 如果桶是从只读事务创建的、键为空、键太大或值太大则返回错误
 func (b *Bucket) Put(key []byte, value []byte) error {
 	if b.tx.db == nil {
 		return ErrTxClosed
@@ -295,25 +293,25 @@ func (b *Bucket) Put(key []byte, value []byte) error {
 		return ErrValueTooLarge
 	}
 
-	// Move cursor to correct position.
+	// 移动游标到正确位置
 	c := b.Cursor()
 	k, _, flags := c.seek(key)
 
-	// Return an error if there is an existing key with a bucket value.
+	// 如果存在具有桶值的现有键则返回错误
 	if bytes.Equal(key, k) && (flags&bucketLeafFlag) != 0 {
 		return ErrIncompatibleValue
 	}
 
-	// Insert into node.
+	// 插入到节点
 	key = cloneBytes(key)
 	c.node().put(key, key, value, 0, 0)
 
 	return nil
 }
 
-// Delete removes a key from the bucket.
-// If the key does not exist then nothing is done and a nil error is returned.
-// Returns an error if the bucket was created from a read-only transaction.
+// Delete 从桶中移除键
+// 如果键不存在则什么都不做并返回nil错误
+// 如果桶是从只读事务创建的则返回错误
 func (b *Bucket) Delete(key []byte) error {
 	if b.tx.db == nil {
 		return ErrTxClosed
@@ -321,25 +319,25 @@ func (b *Bucket) Delete(key []byte) error {
 		return ErrTxNotWritable
 	}
 
-	// Move cursor to correct position.
+	// 移动游标到正确位置
 	c := b.Cursor()
 	_, _, flags := c.seek(key)
 
-	// Return an error if there is already existing bucket value.
+	// 如果已存在桶值则返回错误
 	if (flags & bucketLeafFlag) != 0 {
 		return ErrIncompatibleValue
 	}
 
-	// Delete the node if we have a matching key.
+	// 如果有匹配的键则删除节点
 	c.node().del(key)
 
 	return nil
 }
 
-// Sequence returns the current integer for the bucket without incrementing it.
+// Sequence 返回桶的当前整数而不递增它
 func (b *Bucket) Sequence() uint64 { return b.bucket.sequence }
 
-// SetSequence updates the sequence number for the bucket.
+// SetSequence 更新桶的序列号
 func (b *Bucket) SetSequence(v uint64) error {
 	if b.tx.db == nil {
 		return ErrTxClosed
@@ -347,18 +345,17 @@ func (b *Bucket) SetSequence(v uint64) error {
 		return ErrTxNotWritable
 	}
 
-	// Materialize the root node if it hasn't been already so that the
-	// bucket will be saved during commit.
+	// 如果根节点尚未物化则物化它，以便在提交期间保存桶
 	if b.rootNode == nil {
 		_ = b.node(b.root, nil)
 	}
 
-	// Increment and return the sequence.
+	// 设置序列
 	b.bucket.sequence = v
 	return nil
 }
 
-// NextSequence returns an autoincrementing integer for the bucket.
+// NextSequence 返回桶的自动递增整数
 func (b *Bucket) NextSequence() (uint64, error) {
 	if b.tx.db == nil {
 		return 0, ErrTxClosed
@@ -366,21 +363,19 @@ func (b *Bucket) NextSequence() (uint64, error) {
 		return 0, ErrTxNotWritable
 	}
 
-	// Materialize the root node if it hasn't been already so that the
-	// bucket will be saved during commit.
+	// 如果根节点尚未物化则物化它，以便在提交期间保存桶
 	if b.rootNode == nil {
 		_ = b.node(b.root, nil)
 	}
 
-	// Increment and return the sequence.
+	// 递增并返回序列
 	b.bucket.sequence++
 	return b.bucket.sequence, nil
 }
 
-// ForEach executes a function for each key/value pair in a bucket.
-// If the provided function returns an error then the iteration is stopped and
-// the error is returned to the caller. The provided function must not modify
-// the bucket; this will result in undefined behavior.
+// ForEach 对桶中的每个键值对执行函数
+// 如果提供的函数返回错误，则停止迭代并将错误返回给调用者
+// 提供的函数不得修改桶；这将导致未定义的行为
 func (b *Bucket) ForEach(fn func(k, v []byte) error) error {
 	if b.tx.db == nil {
 		return ErrTxClosed
@@ -394,7 +389,7 @@ func (b *Bucket) ForEach(fn func(k, v []byte) error) error {
 	return nil
 }
 
-// Stat returns stats on a bucket.
+// Stat 返回桶的统计信息
 func (b *Bucket) Stats() BucketStats {
 	var s, subStats BucketStats
 	pageSize := b.tx.db.pageSize
@@ -406,39 +401,38 @@ func (b *Bucket) Stats() BucketStats {
 		if (p.flags & leafPageFlag) != 0 {
 			s.KeyN += int(p.count)
 
-			// used totals the used bytes for the page
+			// used 统计页面使用的字节数
 			used := pageHeaderSize
 
 			if p.count != 0 {
-				// If page has any elements, add all element headers.
+				// 如果页面有任何元素，添加所有元素头部
 				used += leafPageElementSize * int(p.count-1)
 
-				// Add all element key, value sizes.
-				// The computation takes advantage of the fact that the position
-				// of the last element's key/value equals to the total of the sizes
-				// of all previous elements' keys and values.
-				// It also includes the last element's header.
+				// 添加所有元素键、值大小
+				// 计算利用了最后一个元素的键/值位置等于
+				// 所有先前元素的键和值大小总和的事实
+				// 它还包括最后一个元素的头部
 				lastElement := p.leafPageElement(p.count - 1)
 				used += int(lastElement.pos + lastElement.ksize + lastElement.vsize)
 			}
 
 			if b.root == 0 {
-				// For inlined bucket just update the inline stats
+				// 对于内联桶只更新内联统计
 				s.InlineBucketInuse += used
 			} else {
-				// For non-inlined bucket update all the leaf stats
+				// 对于非内联桶更新所有叶子统计
 				s.LeafPageN++
 				s.LeafInuse += used
 				s.LeafOverflowN += int(p.overflow)
 
-				// Collect stats from sub-buckets.
-				// Do that by iterating over all element headers
-				// looking for the ones with the bucketLeafFlag.
+				// 从子桶收集统计信息
+				// 通过遍历所有元素头部来实现，
+				// 寻找带有bucketLeafFlag的元素
 				for i := uint16(0); i < p.count; i++ {
 					e := p.leafPageElement(i)
 					if (e.flags & bucketLeafFlag) != 0 {
-						// For any bucket element, open the element value
-						// and recursively call Stats on the contained bucket.
+						// 对于任何桶元素，打开元素值
+						// 并递归调用包含桶的Stats
 						subStats.Add(b.openBucket(e.value()).Stats())
 					}
 				}
@@ -447,51 +441,51 @@ func (b *Bucket) Stats() BucketStats {
 			s.BranchPageN++
 			lastElement := p.branchPageElement(p.count - 1)
 
-			// used totals the used bytes for the page
-			// Add header and all element headers.
+			// used 统计页面使用的字节数
+			// 添加头部和所有元素头部
 			used := pageHeaderSize + (branchPageElementSize * int(p.count-1))
 
-			// Add size of all keys and values.
-			// Again, use the fact that last element's position equals to
-			// the total of key, value sizes of all previous elements.
+			// 添加所有键和值的大小
+			// 再次使用最后一个元素的位置等于
+			// 所有先前元素的键、值大小总和的事实
 			used += int(lastElement.pos + lastElement.ksize)
 			s.BranchInuse += used
 			s.BranchOverflowN += int(p.overflow)
 		}
 
-		// Keep track of maximum page depth.
+		// 跟踪最大页面深度
 		if depth+1 > s.Depth {
 			s.Depth = (depth + 1)
 		}
 	})
 
-	// Alloc stats can be computed from page counts and pageSize.
+	// 分配统计可以从页面计数和页面大小计算
 	s.BranchAlloc = (s.BranchPageN + s.BranchOverflowN) * pageSize
 	s.LeafAlloc = (s.LeafPageN + s.LeafOverflowN) * pageSize
 
-	// Add the max depth of sub-buckets to get total nested depth.
+	// 添加子桶的最大深度以获得总嵌套深度
 	s.Depth += subStats.Depth
-	// Add the stats for all sub-buckets
+	// 添加所有子桶的统计
 	s.Add(subStats)
 	return s
 }
 
-// forEachPage iterates over every page in a bucket, including inline pages.
+// forEachPage 遍历桶中的每个页面，包括内联页面
 func (b *Bucket) forEachPage(fn func(*page, int)) {
-	// If we have an inline page then just use that.
+	// 如果有内联页面则直接使用它
 	if b.page != nil {
 		fn(b.page, 0)
 		return
 	}
 
-	// Otherwise traverse the page hierarchy.
+	// 否则遍历页面层次结构
 	b.tx.forEachPage(b.root, 0, fn)
 }
 
-// forEachPageNode iterates over every page (or node) in a bucket.
-// This also includes inline pages.
+// forEachPageNode 遍历桶中的每个页面（或节点）
+// 这也包括内联页面
 func (b *Bucket) forEachPageNode(fn func(*page, *node, int)) {
-	// If we have an inline page or root node then just use that.
+	// 如果有内联页面或根节点则直接使用它
 	if b.page != nil {
 		fn(b.page, nil, 0)
 		return
@@ -502,10 +496,10 @@ func (b *Bucket) forEachPageNode(fn func(*page, *node, int)) {
 func (b *Bucket) _forEachPageNode(pgid pgid, depth int, fn func(*page, *node, int)) {
 	var p, n = b.pageNode(pgid)
 
-	// Execute function.
+	// 执行函数
 	fn(p, n, depth)
 
-	// Recursively loop over children.
+	// 递归遍历子节点
 	if p != nil {
 		if (p.flags & branchPageFlag) != 0 {
 			for i := 0; i < int(p.count); i++ {
@@ -522,13 +516,12 @@ func (b *Bucket) _forEachPageNode(pgid pgid, depth int, fn func(*page, *node, in
 	}
 }
 
-// spill writes all the nodes for this bucket to dirty pages.
+// spill 将此桶的所有节点写入脏页面
 func (b *Bucket) spill() error {
-	// Spill all child buckets first.
+	// 首先溢出所有子桶
 	for name, child := range b.buckets {
-		// If the child bucket is small enough and it has no child buckets then
-		// write it inline into the parent bucket's page. Otherwise spill it
-		// like a normal bucket and make the parent value a pointer to the page.
+		// 如果子桶足够小且没有子桶，则将其内联写入父桶的页面
+		// 否则像普通桶一样溢出它，并使父值成为页面的指针
 		var value []byte
 		if child.inlineable() {
 			child.free()
@@ -538,18 +531,18 @@ func (b *Bucket) spill() error {
 				return err
 			}
 
-			// Update the child bucket header in this bucket.
+			// 更新此桶中的子桶头部
 			value = make([]byte, unsafe.Sizeof(bucket{}))
 			var bucket = (*bucket)(unsafe.Pointer(&value[0]))
 			*bucket = *child.bucket
 		}
 
-		// Skip writing the bucket if there are no materialized nodes.
+		// 如果没有物化节点则跳过写入桶
 		if child.rootNode == nil {
 			continue
 		}
 
-		// Update parent node.
+		// 更新父节点
 		var c = b.Cursor()
 		k, _, flags := c.seek([]byte(name))
 		if !bytes.Equal([]byte(name), k) {
@@ -561,18 +554,18 @@ func (b *Bucket) spill() error {
 		c.node().put([]byte(name), []byte(name), value, 0, bucketLeafFlag)
 	}
 
-	// Ignore if there's not a materialized root node.
+	// 如果没有物化的根节点则忽略
 	if b.rootNode == nil {
 		return nil
 	}
 
-	// Spill nodes.
+	// 溢出节点
 	if err := b.rootNode.spill(); err != nil {
 		return err
 	}
 	b.rootNode = b.rootNode.root()
 
-	// Update the root node for this bucket.
+	// 更新此桶的根节点
 	if b.rootNode.pgid >= b.tx.meta.pgid {
 		panic(fmt.Sprintf("pgid (%d) above high water mark (%d)", b.rootNode.pgid, b.tx.meta.pgid))
 	}
@@ -581,18 +574,17 @@ func (b *Bucket) spill() error {
 	return nil
 }
 
-// inlineable returns true if a bucket is small enough to be written inline
-// and if it contains no subbuckets. Otherwise returns false.
+// inlineable 如果桶足够小可以内联写入且不包含子桶则返回true
+// 否则返回false
 func (b *Bucket) inlineable() bool {
 	var n = b.rootNode
 
-	// Bucket must only contain a single leaf node.
+	// 桶必须只包含单个叶子节点
 	if n == nil || !n.isLeaf {
 		return false
 	}
 
-	// Bucket is not inlineable if it contains subbuckets or if it goes beyond
-	// our threshold for inline bucket size.
+	// 如果桶包含子桶或超过内联桶大小阈值则不可内联
 	var size = pageHeaderSize
 	for _, inode := range n.inodes {
 		size += leafPageElementSize + len(inode.key) + len(inode.value)
@@ -607,29 +599,29 @@ func (b *Bucket) inlineable() bool {
 	return true
 }
 
-// Returns the maximum total size of a bucket to make it a candidate for inlining.
+// 返回桶成为内联候选的最大总大小
 func (b *Bucket) maxInlineBucketSize() int {
 	return b.tx.db.pageSize / 4
 }
 
-// write allocates and writes a bucket to a byte slice.
+// write 分配并将桶写入字节切片
 func (b *Bucket) write() []byte {
-	// Allocate the appropriate size.
+	// 分配适当的大小
 	var n = b.rootNode
 	var value = make([]byte, bucketHeaderSize+n.size())
 
-	// Write a bucket header.
+	// 写入桶头部
 	var bucket = (*bucket)(unsafe.Pointer(&value[0]))
 	*bucket = *b.bucket
 
-	// Convert byte slice to a fake page and write the root node.
+	// 将字节切片转换为假页面并写入根节点
 	var p = (*page)(unsafe.Pointer(&value[bucketHeaderSize]))
 	n.write(p)
 
 	return value
 }
 
-// rebalance attempts to balance all nodes.
+// rebalance 尝试平衡所有节点
 func (b *Bucket) rebalance() {
 	for _, n := range b.nodes {
 		n.rebalance()
@@ -639,16 +631,16 @@ func (b *Bucket) rebalance() {
 	}
 }
 
-// node creates a node from a page and associates it with a given parent.
+// node 从页面创建节点并将其与给定父节点关联
 func (b *Bucket) node(pgid pgid, parent *node) *node {
 	_assert(b.nodes != nil, "nodes map expected")
 
-	// Retrieve node if it's already been created.
+	// 如果节点已创建则检索它
 	if n := b.nodes[pgid]; n != nil {
 		return n
 	}
 
-	// Otherwise create a node and cache it.
+	// 否则创建节点并缓存它
 	n := &node{bucket: b, parent: parent}
 	if parent == nil {
 		b.rootNode = n
@@ -656,23 +648,23 @@ func (b *Bucket) node(pgid pgid, parent *node) *node {
 		parent.children = append(parent.children, n)
 	}
 
-	// Use the inline page if this is an inline bucket.
+	// 如果这是内联桶则使用内联页面
 	var p = b.page
 	if p == nil {
 		p = b.tx.page(pgid)
 	}
 
-	// Read the page into the node and cache it.
+	// 将页面读入节点并缓存它
 	n.read(p)
 	b.nodes[pgid] = n
 
-	// Update statistics.
+	// 更新统计
 	b.tx.stats.NodeCount++
 
 	return n
 }
 
-// free recursively frees all pages in the bucket.
+// free 递归释放桶中的所有页面
 func (b *Bucket) free() {
 	if b.root == 0 {
 		return
@@ -689,7 +681,7 @@ func (b *Bucket) free() {
 	b.root = 0
 }
 
-// dereference removes all references to the old mmap.
+// dereference 移除对旧mmap的所有引用
 func (b *Bucket) dereference() {
 	if b.rootNode != nil {
 		b.rootNode.root().dereference()
@@ -700,11 +692,11 @@ func (b *Bucket) dereference() {
 	}
 }
 
-// pageNode returns the in-memory node, if it exists.
-// Otherwise returns the underlying page.
+// pageNode 返回内存中的节点（如果存在）
+// 否则返回底层页面
 func (b *Bucket) pageNode(id pgid) (*page, *node) {
-	// Inline buckets have a fake page embedded in their value so treat them
-	// differently. We'll return the rootNode (if available) or the fake page.
+	// 内联桶在其值中嵌入了假页面，所以区别对待
+	// 我们将返回rootNode（如果可用）或假页面
 	if b.root == 0 {
 		if id != 0 {
 			panic(fmt.Sprintf("inline bucket non-zero page access(2): %d != 0", id))
@@ -715,39 +707,39 @@ func (b *Bucket) pageNode(id pgid) (*page, *node) {
 		return b.page, nil
 	}
 
-	// Check the node cache for non-inline buckets.
+	// 检查非内联桶的节点缓存
 	if b.nodes != nil {
 		if n := b.nodes[id]; n != nil {
 			return nil, n
 		}
 	}
 
-	// Finally lookup the page from the transaction if no node is materialized.
+	// 最后如果没有物化节点则从事务中查找页面
 	return b.tx.page(id), nil
 }
 
-// BucketStats records statistics about resources used by a bucket.
+// BucketStats 记录桶使用的资源统计信息
 type BucketStats struct {
-	// Page count statistics.
-	BranchPageN     int // number of logical branch pages
-	BranchOverflowN int // number of physical branch overflow pages
-	LeafPageN       int // number of logical leaf pages
-	LeafOverflowN   int // number of physical leaf overflow pages
+	// 页面计数统计
+	BranchPageN     int // 逻辑分支页面数
+	BranchOverflowN int // 物理分支溢出页面数
+	LeafPageN       int // 逻辑叶子页面数
+	LeafOverflowN   int // 物理叶子溢出页面数
 
-	// Tree statistics.
-	KeyN  int // number of keys/value pairs
-	Depth int // number of levels in B+tree
+	// 树统计
+	KeyN  int // 键值对数量
+	Depth int // B+树层数
 
-	// Page size utilization.
-	BranchAlloc int // bytes allocated for physical branch pages
-	BranchInuse int // bytes actually used for branch data
-	LeafAlloc   int // bytes allocated for physical leaf pages
-	LeafInuse   int // bytes actually used for leaf data
+	// 页面大小利用率
+	BranchAlloc int // 为物理分支页面分配的字节数
+	BranchInuse int // 实际用于分支数据的字节数
+	LeafAlloc   int // 为物理叶子页面分配的字节数
+	LeafInuse   int // 实际用于叶子数据的字节数
 
-	// Bucket statistics
-	BucketN           int // total number of buckets including the top bucket
-	InlineBucketN     int // total number on inlined buckets
-	InlineBucketInuse int // bytes used for inlined buckets (also accounted for in LeafInuse)
+	// 桶统计
+	BucketN           int // 包括顶级桶在内的桶总数
+	InlineBucketN     int // 内联桶总数
+	InlineBucketInuse int // 内联桶使用的字节数（也计入LeafInuse）
 }
 
 func (s *BucketStats) Add(other BucketStats) {
@@ -769,7 +761,7 @@ func (s *BucketStats) Add(other BucketStats) {
 	s.InlineBucketInuse += other.InlineBucketInuse
 }
 
-// cloneBytes returns a copy of a given slice.
+// cloneBytes 返回给定切片的副本
 func cloneBytes(v []byte) []byte {
 	var clone = make([]byte, len(v))
 	copy(clone, v)

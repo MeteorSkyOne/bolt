@@ -1,6 +1,3 @@
-//go:build !windows && !plan9 && !solaris
-// +build !windows,!plan9,!solaris
-
 package kvdb
 
 import (
@@ -11,21 +8,20 @@ import (
 	"unsafe"
 )
 
-// maxMapSize represents the largest mmap size supported by kvdb.
+// maxMapSize 表示 kvdb 支持的最大 mmap 大小
 const maxMapSize = 0xFFFFFFFFFFFF // 256TB
 
-// maxAllocSize is the size used when creating array pointers.
+// maxAllocSize 是创建数组指针时使用的大小
 const maxAllocSize = 0x7FFFFFFF
 
-// Are unaligned load/stores broken on this arch?
+// brokenUnaligned 表示此架构上是否存在非对齐加载/存储问题
 var brokenUnaligned = false
 
-// flock acquires an advisory lock on a file descriptor.
+// flock 在文件描述符上获取咨询锁
 func flock(db *DB, mode os.FileMode, exclusive bool, timeout time.Duration) error {
 	var t time.Time
 	for {
-		// If we're beyond our timeout then return an error.
-		// This can only occur after we've attempted a flock once.
+		// 如果超时则返回错误
 		if t.IsZero() {
 			t = time.Now()
 		} else if timeout > 0 && time.Since(t) > timeout {
@@ -36,7 +32,7 @@ func flock(db *DB, mode os.FileMode, exclusive bool, timeout time.Duration) erro
 			flag = syscall.LOCK_EX
 		}
 
-		// Otherwise attempt to obtain an exclusive lock.
+		// 尝试获取锁
 		err := syscall.Flock(int(db.file.Fd()), flag|syscall.LOCK_NB)
 		if err == nil {
 			return nil
@@ -44,44 +40,44 @@ func flock(db *DB, mode os.FileMode, exclusive bool, timeout time.Duration) erro
 			return err
 		}
 
-		// Wait for a bit and try again.
+		// 等待一段时间后重试
 		time.Sleep(50 * time.Millisecond)
 	}
 }
 
-// funlock releases an advisory lock on a file descriptor.
+// funlock 释放文件描述符上的咨询锁
 func funlock(db *DB) error {
 	return syscall.Flock(int(db.file.Fd()), syscall.LOCK_UN)
 }
 
-// mmap memory maps a DB's data file.
+// mmap 将数据库的数据文件映射到内存
 func mmap(db *DB, sz int) error {
-	// Map the data file to memory.
+	// 将数据文件映射到内存
 	b, err := syscall.Mmap(int(db.file.Fd()), 0, sz, syscall.PROT_READ, syscall.MAP_SHARED|db.MmapFlags)
 	if err != nil {
 		return err
 	}
 
-	// Advise the kernel that the mmap is accessed randomly.
+	// 建议内核该 mmap 是随机访问的
 	if err := madvise(b, syscall.MADV_RANDOM); err != nil {
 		return fmt.Errorf("madvise: %s", err)
 	}
 
-	// Save the original byte slice and convert to a byte array pointer.
+	// 保存原始字节切片并转换为字节数组指针
 	db.dataref = b
 	db.data = (*[maxMapSize]byte)(unsafe.Pointer(&b[0]))
 	db.datasz = sz
 	return nil
 }
 
-// munmap unmaps a DB's data file from memory.
+// munmap 从内存中取消映射数据库的数据文件
 func munmap(db *DB) error {
-	// Ignore the unmap if we have no mapped data.
+	// 如果没有映射数据则忽略取消映射操作
 	if db.dataref == nil {
 		return nil
 	}
 
-	// Unmap using the original byte slice.
+	// 使用原始字节切片进行取消映射
 	err := syscall.Munmap(db.dataref)
 	db.dataref = nil
 	db.data = nil
@@ -89,7 +85,7 @@ func munmap(db *DB) error {
 	return err
 }
 
-// NOTE: This function is copied from stdlib because it is not available on darwin.
+// 注意：此函数从标准库复制而来，因为在 darwin 上不可用
 func madvise(b []byte, advice int) (err error) {
 	_, _, e1 := syscall.Syscall(syscall.SYS_MADVISE, uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)), uintptr(advice))
 	if e1 != 0 {
@@ -98,7 +94,7 @@ func madvise(b []byte, advice int) (err error) {
 	return
 }
 
-// fdatasync flushes written data to a file descriptor.
+// fdatasync 将写入的数据刷新到文件描述符
 func fdatasync(db *DB) error {
 	return syscall.Fdatasync(int(db.file.Fd()))
 }
