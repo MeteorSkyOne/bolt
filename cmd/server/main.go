@@ -513,6 +513,9 @@ func (ds *DatabaseServer) executeCommand(session *ClientSession, command string)
 	defer session.mu.Unlock()
 
 	switch cmd {
+	case "BEGINREAD":
+		return ds.beginReadTransaction(session)
+
 	case "BEGIN":
 		return ds.beginTransaction(session)
 
@@ -604,6 +607,22 @@ func (ds *DatabaseServer) beginTransaction(session *ClientSession) string {
 	return "BEGIN -> transaction started"
 }
 
+// beginReadTransaction 开始只读事务
+func (ds *DatabaseServer) beginReadTransaction(session *ClientSession) string {
+	if session.inTransaction {
+		return "Error: Already in transaction"
+	}
+
+	tx, err := ds.db.Begin(false) // 使用只读事务
+	if err != nil {
+		return fmt.Sprintf("Error starting transaction: %v", err)
+	}
+
+	session.inTransaction = true
+	session.kvdbTx = tx
+	return "BEGINREAD -> readonly transaction started"
+}
+
 // commitTransaction 提交事务
 func (ds *DatabaseServer) commitTransaction(session *ClientSession) string {
 	if !session.inTransaction {
@@ -615,6 +634,11 @@ func (ds *DatabaseServer) commitTransaction(session *ClientSession) string {
 		// 重置不一致的状态
 		session.inTransaction = false
 		return "Error: Transaction state is inconsistent"
+	}
+
+	if !session.kvdbTx.Writable() {
+		// 只读事务不能提交
+		return ds.abortTransaction(session)
 	}
 
 	// 提交事务
