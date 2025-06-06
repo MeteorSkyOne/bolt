@@ -96,5 +96,5 @@ func madvise(b []byte, advice int) (err error) {
 
 // fdatasync 将写入的数据刷新到文件描述符
 func fdatasync(db *DB) error {
-	return syscall.Fdatasync(int(db.file.Fd()))
+	return db.file.Sync()
 }
