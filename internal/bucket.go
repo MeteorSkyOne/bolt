@@ -7,10 +7,10 @@ import (
 )
 
 const (
-	// MaxKeySize 是键的最大长度，以字节为单位
+	// 键的最大长度(字节)
 	MaxKeySize = 32768
 
-	// MaxValueSize 是值的最大长度，以字节为单位
+	// 值的最大长度(字节)
 	MaxValueSize = (1 << 31) - 2
 )
 
@@ -129,17 +129,9 @@ func (b *Bucket) Bucket(name []byte) *Bucket {
 func (b *Bucket) openBucket(value []byte) *Bucket {
 	var child = newBucket(b.tx)
 
-	// 如果在此架构上未对齐的加载/存储被破坏且值未对齐，
-	// 则简单地克隆到对齐的字节数组
-	unaligned := brokenUnaligned && uintptr(unsafe.Pointer(&value[0]))&3 != 0
-
-	if unaligned {
-		value = cloneBytes(value)
-	}
-
 	// 如果这是可写事务，则需要复制桶条目
 	// 只读事务可以直接指向mmap条目
-	if b.tx.writable && !unaligned {
+	if b.tx.writable {
 		child.bucket = &bucket{}
 		*child.bucket = *(*bucket)(unsafe.Pointer(&value[0]))
 	} else {
@@ -190,7 +182,7 @@ func (b *Bucket) CreateBucket(key []byte) (*Bucket, error) {
 	key = cloneBytes(key)
 	c.node().put(key, key, value, 0, bucketLeafFlag)
 
-	// 由于内联桶不允许子桶，我们需要取消引用内联页面（如果存在）
+	// 由于内联桶不允许子桶，需要取消引用内联页面（如果存在）
 	// 这将导致桶在事务的其余部分被视为常规的非内联桶
 	b.page = nil
 
@@ -409,9 +401,6 @@ func (b *Bucket) Stats() BucketStats {
 				used += leafPageElementSize * int(p.count-1)
 
 				// 添加所有元素键、值大小
-				// 计算利用了最后一个元素的键/值位置等于
-				// 所有先前元素的键和值大小总和的事实
-				// 它还包括最后一个元素的头部
 				lastElement := p.leafPageElement(p.count - 1)
 				used += int(lastElement.pos + lastElement.ksize + lastElement.vsize)
 			}
@@ -696,7 +685,7 @@ func (b *Bucket) dereference() {
 // 否则返回底层页面
 func (b *Bucket) pageNode(id pgid) (*page, *node) {
 	// 内联桶在其值中嵌入了假页面，所以区别对待
-	// 我们将返回rootNode（如果可用）或假页面
+	// 将返回rootNode（如果可用）或假页面
 	if b.root == 0 {
 		if id != 0 {
 			panic(fmt.Sprintf("inline bucket non-zero page access(2): %d != 0", id))

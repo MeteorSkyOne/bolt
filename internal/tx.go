@@ -10,16 +10,11 @@ import (
 	"unsafe"
 )
 
-// txid 表示内部事务标识符
 type txid uint64
 
 // Tx 表示数据库上的只读或读写事务
 // 只读事务可用于检索键值和创建游标
 // 读写事务可以创建和删除存储桶以及创建和删除键
-//
-// 重要提示：完成事务后必须提交或回滚事务
-// 在没有更多事务使用页面之前，写入器无法回收页面
-// 长时间运行的读事务可能导致数据库快速增长
 type Tx struct {
 	writable       bool
 	managed        bool
@@ -32,9 +27,6 @@ type Tx struct {
 
 	// WriteFlag 指定写相关方法（如 WriteTo()）的标志
 	// Tx 使用指定的标志打开数据库文件来复制数据
-	//
-	// 默认情况下，标志未设置，这对于主要在内存中的工作负载效果很好
-	// 对于比可用 RAM 大得多的数据库，将标志设置为 syscall.O_DIRECT 以避免破坏页面缓存
 	WriteFlag int
 }
 
@@ -43,7 +35,7 @@ func (tx *Tx) init(db *DB) {
 	tx.db = db
 	tx.pages = nil
 
-	// 复制元页面，因为它可能被写入器更改
+	// 复制元页面，防止被writer修改
 	tx.meta = &meta{}
 	db.meta().copy(tx.meta)
 
@@ -81,22 +73,19 @@ func (tx *Tx) init(db *DB) {
 	}
 }
 
-// ID 返回事务ID
 func (tx *Tx) ID() int {
 	return int(tx.meta.txid)
 }
 
-// DB 返回创建事务的数据库引用
 func (tx *Tx) DB() *DB {
 	return tx.db
 }
 
-// Size 返回此事务看到的当前数据库大小（字节）
+// 返回此事务看到的当前数据库大小（字节）
 func (tx *Tx) Size() int64 {
 	return int64(tx.meta.pgid) * int64(tx.db.pageSize)
 }
 
-// Writable 返回事务是否可以执行写操作
 func (tx *Tx) Writable() bool {
 	return tx.writable
 }
@@ -108,40 +97,26 @@ func (tx *Tx) Cursor() *Cursor {
 	return tx.root.Cursor()
 }
 
-// Stats 检索当前事务统计信息的副本
 func (tx *Tx) Stats() TxStats {
 	return tx.stats
 }
 
-// Bucket 按名称检索存储桶
-// 如果存储桶不存在则返回nil
-// 存储桶实例仅在事务生命周期内有效
 func (tx *Tx) Bucket(name []byte) *Bucket {
 	return tx.root.Bucket(name)
 }
 
-// CreateBucket 创建新存储桶
-// 如果存储桶已存在、存储桶名称为空或存储桶名称过长，则返回错误
-// 存储桶实例仅在事务生命周期内有效
 func (tx *Tx) CreateBucket(name []byte) (*Bucket, error) {
 	return tx.root.CreateBucket(name)
 }
 
-// CreateBucketIfNotExists 如果存储桶不存在则创建新存储桶
-// 如果存储桶名称为空或存储桶名称过长，则返回错误
-// 存储桶实例仅在事务生命周期内有效
 func (tx *Tx) CreateBucketIfNotExists(name []byte) (*Bucket, error) {
 	return tx.root.CreateBucketIfNotExists(name)
 }
 
-// DeleteBucket 删除存储桶
-// 如果找不到存储桶或键表示非存储桶值，则返回错误
 func (tx *Tx) DeleteBucket(name []byte) error {
 	return tx.root.DeleteBucket(name)
 }
 
-// ForEach 为根中的每个存储桶执行函数
-// 如果提供的函数返回错误，则停止迭代并将错误返回给调用者
 func (tx *Tx) ForEach(fn func(name []byte, b *Bucket) error) error {
 	return tx.root.ForEach(func(k, v []byte) error {
 		if err := fn(k, tx.root.Bucket(k)); err != nil {
@@ -151,13 +126,10 @@ func (tx *Tx) ForEach(fn func(name []byte, b *Bucket) error) error {
 	})
 }
 
-// OnCommit 添加在事务成功提交后执行的处理函数
 func (tx *Tx) OnCommit(fn func()) {
 	tx.commitHandlers = append(tx.commitHandlers, fn)
 }
 
-// Commit 将所有更改写入磁盘并更新元页面
-// 如果发生磁盘写入错误或在只读事务上调用Commit，则返回错误
 func (tx *Tx) Commit() error {
 	_assert(!tx.managed, "managed tx commit not allowed")
 	if tx.db == nil {
@@ -165,8 +137,6 @@ func (tx *Tx) Commit() error {
 	} else if !tx.writable {
 		return ErrTxNotWritable
 	}
-
-	// TODO(benbjohnson): 使用向量化I/O写出脏页面
 
 	// 重新平衡已删除的节点
 	var startTime = time.Now()
@@ -189,7 +159,7 @@ func (tx *Tx) Commit() error {
 	opgid := tx.meta.pgid
 
 	// 释放空闲列表并为其分配新页面
-	// 这会高估空闲列表的大小但不会低估大小（这会很糟糕）
+	// 可能会高估空闲列表的大小，但不会低估
 	tx.db.freelist.free(tx.meta.txid, tx.db.page(tx.meta.freelist))
 	p, err := tx.allocate((tx.db.freelist.size() / tx.db.pageSize) + 1)
 	if err != nil {
@@ -244,7 +214,6 @@ func (tx *Tx) Commit() error {
 	// 完成事务
 	tx.close()
 
-	// 现在锁已被移除，执行提交处理程序
 	for _, fn := range tx.commitHandlers {
 		fn()
 	}
@@ -252,8 +221,6 @@ func (tx *Tx) Commit() error {
 	return nil
 }
 
-// Rollback 关闭事务并忽略所有先前的更新
-// 只读事务必须回滚而不是提交
 func (tx *Tx) Rollback() error {
 	_assert(!tx.managed, "managed tx rollback not allowed")
 	if tx.db == nil {
@@ -307,19 +274,14 @@ func (tx *Tx) close() {
 	tx.pages = nil
 }
 
-// Copy 将整个数据库写入写入器
-// 此函数为向后兼容而存在
-//
-// 已弃用；请使用 WriteTo()
 func (tx *Tx) Copy(w io.Writer) error {
 	_, err := tx.WriteTo(w)
 	return err
 }
 
-// WriteTo 将整个数据库写入写入器
-// 如果 err == nil，则恰好将 tx.Size() 字节写入写入器
+// 写入数据，如果 err == nil，则恰好将 tx.Size() 字节写入写入器
 func (tx *Tx) WriteTo(w io.Writer) (n int64, err error) {
-	// 尝试使用 WriteFlag 打开读取器
+	// 用 WriteFlag 打开读取器
 	f, err := os.OpenFile(tx.db.path, os.O_RDONLY|tx.WriteFlag, 0)
 	if err != nil {
 		return 0, err
@@ -366,7 +328,7 @@ func (tx *Tx) WriteTo(w io.Writer) (n int64, err error) {
 	return n, f.Close()
 }
 
-// CopyFile 将整个数据库复制到给定路径的文件
+// 将整个数据库复制到给定路径的文件
 // 在复制期间维护读取器事务，因此在复制进行时继续使用数据库是安全的
 func (tx *Tx) CopyFile(path string, mode os.FileMode) error {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, mode)
@@ -382,12 +344,7 @@ func (tx *Tx) CopyFile(path string, mode os.FileMode) error {
 	return f.Close()
 }
 
-// Check 对此事务的数据库执行多项一致性检查
-// 如果发现任何不一致，则返回错误
-//
-// 可以在可写事务上安全地并发运行
-// 但是，对于大型数据库和具有大量子存储桶的数据库，由于缓存，这会产生高成本
-// 如果在只读事务上运行，可以消除此开销，但是同时执行其他写入器事务是不安全的
+// 对此事务的数据库执行多项一致性检查
 func (tx *Tx) Check() <-chan error {
 	ch := make(chan error)
 	go tx.check(ch)
@@ -450,7 +407,7 @@ func (tx *Tx) checkBucket(b *Bucket, reachable map[pgid]*page, freed map[pgid]bo
 			reachable[id] = p
 		}
 
-		// 我们应该只遇到未释放的叶子和分支页面
+		// 应该只遇到未释放的叶子和分支页面
 		if freed[p.id] {
 			ch <- fmt.Errorf("page %d: reachable freed", int(p.id))
 		} else if (p.flags&branchPageFlag) == 0 && (p.flags&leafPageFlag) == 0 {
@@ -467,7 +424,7 @@ func (tx *Tx) checkBucket(b *Bucket, reachable map[pgid]*page, freed map[pgid]bo
 	})
 }
 
-// allocate 返回从给定页面开始的连续内存块
+// 返回从给定页面开始的连续内存块
 func (tx *Tx) allocate(count int) (*page, error) {
 	p, err := tx.db.allocate(count)
 	if err != nil {
@@ -484,7 +441,7 @@ func (tx *Tx) allocate(count int) (*page, error) {
 	return p, nil
 }
 
-// write 将任何脏页面写入磁盘
+// 将任何脏页写入磁盘
 func (tx *Tx) write() error {
 	// 按ID排序页面
 	pages := make(pages, 0, len(tx.pages))
@@ -500,7 +457,7 @@ func (tx *Tx) write() error {
 		size := (int(p.overflow) + 1) * tx.db.pageSize
 		offset := int64(p.id) * int64(tx.db.pageSize)
 
-		// 以"最大分配"大小的块写出页面
+		// 以 maxAllocSize 大小的块写入页面
 		ptr := (*[maxAllocSize]byte)(unsafe.Pointer(p))
 		for {
 			// 将写入限制为最大分配大小
@@ -530,8 +487,8 @@ func (tx *Tx) write() error {
 		}
 	}
 
-	// 如果在DB上设置了标志，则忽略文件同步
-	if !tx.db.NoSync || IgnoreNoSync {
+	// 如果在DB上设置了flag，则忽略文件同步
+	if !tx.db.NoSync {
 		if err := fdatasync(tx.db); err != nil {
 			return err
 		}
@@ -539,15 +496,13 @@ func (tx *Tx) write() error {
 
 	// 将小页面放回页面池
 	for _, p := range pages {
-		// 忽略超过1页的页面大小
-		// 这些是使用make()而不是页面池分配的
+		// 忽略超过1页的页面大小，这些是使用make()分配的，而不是页面池分配的
 		if int(p.overflow) != 0 {
 			continue
 		}
 
 		buf := (*[maxAllocSize]byte)(unsafe.Pointer(p))[:tx.db.pageSize]
 
-		// 参见 https://go.googlesource.com/go/+/f03c9202c43e0abb130669852082117ca50aa9b1
 		for i := range buf {
 			buf[i] = 0
 		}
@@ -557,7 +512,6 @@ func (tx *Tx) write() error {
 	return nil
 }
 
-// writeMeta 将元数据写入磁盘
 func (tx *Tx) writeMeta() error {
 	// 为元页面创建临时缓冲区
 	buf := make([]byte, tx.db.pageSize)
@@ -568,7 +522,7 @@ func (tx *Tx) writeMeta() error {
 	if _, err := tx.db.ops.writeAt(buf, int64(p.id)*int64(tx.db.pageSize)); err != nil {
 		return err
 	}
-	if !tx.db.NoSync || IgnoreNoSync {
+	if !tx.db.NoSync {
 		if err := fdatasync(tx.db); err != nil {
 			return err
 		}
@@ -580,7 +534,7 @@ func (tx *Tx) writeMeta() error {
 	return nil
 }
 
-// page 返回具有给定ID的页面的引用
+// 返回具有给定ID的页面的引用
 // 如果页面已被写入，则返回临时缓冲页面
 func (tx *Tx) page(id pgid) *page {
 	// 首先检查脏页面
@@ -594,7 +548,6 @@ func (tx *Tx) page(id pgid) *page {
 	return tx.db.page(id)
 }
 
-// forEachPage 遍历给定页面内的每个页面并执行函数
 func (tx *Tx) forEachPage(pgid pgid, depth int, fn func(*page, int)) {
 	p := tx.page(pgid)
 
@@ -610,7 +563,7 @@ func (tx *Tx) forEachPage(pgid pgid, depth int, fn func(*page, int)) {
 	}
 }
 
-// Page 返回给定页面号的页面信息
+// 返回给定页面号的页面信息
 // 仅在可写事务使用时才能安全并发使用
 func (tx *Tx) Page(id int) (*PageInfo, error) {
 	if tx.db == nil {
@@ -637,29 +590,23 @@ func (tx *Tx) Page(id int) (*PageInfo, error) {
 	return info, nil
 }
 
-// TxStats 表示事务执行的操作统计信息
+// 事务执行的操作统计信息
 type TxStats struct {
-	// 页面统计
 	PageCount int // 页面分配数量
 	PageAlloc int // 分配的总字节数
 
-	// 游标统计
 	CursorCount int // 创建的游标数量
 
-	// 节点统计
 	NodeCount int // 节点分配数量
 	NodeDeref int // 节点解引用数量
 
-	// 重平衡统计
 	Rebalance     int           // 节点重平衡数量
 	RebalanceTime time.Duration // 重平衡总时间
 
-	// 分割/溢出统计
 	Split     int           // 节点分割数量
 	Spill     int           // 节点溢出数量
 	SpillTime time.Duration // 溢出总时间
 
-	// 写入统计
 	Write     int           // 执行的写入数量
 	WriteTime time.Duration // 写入磁盘的总时间
 }
@@ -679,8 +626,7 @@ func (s *TxStats) add(other *TxStats) {
 	s.WriteTime += other.WriteTime
 }
 
-// Sub 计算并返回两组事务统计信息之间的差异
-// 当在两个不同时间点获取统计信息时很有用，您需要在该时间跨度内发生的性能计数器
+// 计算并返回两组事务统计信息之间的差异
 func (s *TxStats) Sub(other *TxStats) TxStats {
 	var diff TxStats
 	diff.PageCount = s.PageCount - other.PageCount

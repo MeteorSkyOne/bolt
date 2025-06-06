@@ -47,7 +47,7 @@ func (n *node) size() int {
 }
 
 // sizeLessThan 如果节点小于给定大小则返回true
-// 这是一个优化，避免在只需要知道是否适合某个页面大小时计算大节点
+// 避免在只需要知道是否适合某个页面大小时计算大节点
 func (n *node) sizeLessThan(v int) bool {
 	sz, elsz := pageHeaderSize, n.pageElementSize()
 	for i := 0; i < len(n.inodes); i++ {
@@ -237,12 +237,9 @@ func (n *node) write(p *page) {
 		copy(b[0:], item.value)
 		b = b[vlen:]
 	}
-
-	// DEBUG ONLY: n.dump()
 }
 
 // split 如果合适，将节点分解为多个较小的节点
-// 这应该只从spill()函数调用
 func (n *node) split(pageSize int) []*node {
 	var nodes []*node
 
@@ -265,7 +262,6 @@ func (n *node) split(pageSize int) []*node {
 }
 
 // splitTwo 如果合适，将节点分解为两个较小的节点
-// 这应该只从split()函数调用
 func (n *node) splitTwo(pageSize int) (*node, *node) {
 	// 如果页面没有至少足够两页的节点或节点可以放在单个页面中，则忽略分割
 	if len(n.inodes) <= (minKeysPerPage*2) || n.sizeLessThan(pageSize) {
@@ -305,18 +301,17 @@ func (n *node) splitTwo(pageSize int) (*node, *node) {
 }
 
 // splitIndex 查找页面填充给定阈值的位置
-// 它返回索引以及第一页的大小
-// 这只能从split()调用
+// 返回索引以及第一页的大小
 func (n *node) splitIndex(threshold int) (index, sz int) {
 	sz = pageHeaderSize
 
-	// 循环直到我们只有第二页所需的最小键数
+	// 循环直到只有第二页所需的最小键数
 	for i := 0; i < len(n.inodes)-minKeysPerPage; i++ {
 		index = i
 		inode := n.inodes[i]
 		elsize := n.pageElementSize() + len(inode.key) + len(inode.value)
 
-		// 如果我们至少有最小键数并且添加另一个节点会超过阈值，则退出并返回
+		// 如果至少有最小键数并且添加另一个节点会超过阈值，则退出并返回
 		if i >= minKeysPerPage && sz+elsize > threshold {
 			break
 		}
@@ -337,7 +332,7 @@ func (n *node) spill() error {
 	}
 
 	// 首先溢出子节点。子节点可以在分割合并的情况下实现兄弟节点
-	// 因此我们不能使用范围循环。我们必须在每次循环迭代时检查子节点大小
+	// 因此不能使用范围循环。必须在每次循环迭代时检查子节点大小
 	sort.Sort(n.children)
 	for i := 0; i < len(n.children); i++ {
 		if err := n.children[i].spill(); err != nil {
@@ -345,7 +340,7 @@ func (n *node) spill() error {
 		}
 	}
 
-	// 我们不再需要子列表，因为它只用于溢出跟踪
+	// 不再需要子列表，因为它只用于溢出跟踪
 	n.children = nil
 
 	// 将节点分割为适当的大小。第一个节点始终是n
@@ -387,8 +382,8 @@ func (n *node) spill() error {
 		tx.stats.Spill++
 	}
 
-	// 如果根节点分割并创建了新根，那么我们也需要溢出它
-	// 我们将清除子节点以确保它不会尝试重新溢出
+	// 如果根节点分割并创建了新根，那么也需要溢出它
+	// 清除子节点以确保它不会尝试重新溢出
 	if n.parent != nil && n.parent.pgid == 0 {
 		n.children = nil
 		return n.parent.spill()
@@ -549,33 +544,6 @@ func (n *node) free() {
 		n.pgid = 0
 	}
 }
-
-// dump writes the contents of the node to STDERR for debugging purposes.
-/*
-func (n *node) dump() {
-	// Write node header.
-	var typ = "branch"
-	if n.isLeaf {
-		typ = "leaf"
-	}
-	warnf("[NODE %d {type=%s count=%d}]", n.pgid, typ, len(n.inodes))
-
-	// Write out abbreviated version of each item.
-	for _, item := range n.inodes {
-		if n.isLeaf {
-			if item.flags&bucketLeafFlag != 0 {
-				bucket := (*bucket)(unsafe.Pointer(&item.value[0]))
-				warnf("+L %08x -> (bucket root=%d)", trunc(item.key, 4), bucket.root)
-			} else {
-				warnf("+L %08x -> %08x", trunc(item.key, 4), trunc(item.value, 4))
-			}
-		} else {
-			warnf("+B %08x -> pgid=%d", trunc(item.key, 4), item.pgid)
-		}
-	}
-	warn("")
-}
-*/
 
 type nodes []*node
 

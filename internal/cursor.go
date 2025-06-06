@@ -6,14 +6,9 @@ import (
 	"sort"
 )
 
-// Cursor 表示一个迭代器，可以按排序顺序遍历桶中的所有键/值对。
-// 游标将嵌套桶视为值为 nil 的项。
-// 游标可以从事务中获取，并且在事务打开期间有效。
-//
-// 从游标返回的键和值仅在事务生命周期内有效。
-//
-// 在使用游标遍历时更改数据可能会导致游标失效并返回意外的键和/或值。
-// 在修改数据后必须重新定位游标。
+// Cursor 表示桶中键值对的迭代器。
+// 游标在事务期间有效，返回的键值仅在事务生命周期内有效。
+// 修改数据后需要重新定位游标。
 type Cursor struct {
 	bucket *Bucket
 	stack  []elemRef
@@ -84,7 +79,7 @@ func (c *Cursor) Prev() (key []byte, value []byte) {
 	_assert(c.bucket.tx.db != nil, "tx closed")
 
 	// 尝试向后移动一个元素，直到成功。
-	// 当我们到达堆栈中每个页面的开头时，向上移动堆栈。
+	// 当到达堆栈中每个页面的开头时，向上移动堆栈。
 	for i := len(c.stack) - 1; i >= 0; i-- {
 		elem := &c.stack[i]
 		if elem.index > 0 {
@@ -114,7 +109,7 @@ func (c *Cursor) Prev() (key []byte, value []byte) {
 func (c *Cursor) Seek(seek []byte) (key []byte, value []byte) {
 	k, v, flags := c.seek(seek)
 
-	// 如果我们在页面的最后一个元素之后结束，则移动到下一个
+	// 如果在页面的最后一个元素之后结束，则移动到下一个
 	if ref := &c.stack[len(c.stack)-1]; ref.index >= ref.count() {
 		k, v, flags = c.next()
 	}
@@ -214,7 +209,7 @@ func (c *Cursor) last() {
 func (c *Cursor) next() (key []byte, value []byte, flags uint32) {
 	for {
 		// 尝试移动一个元素，直到成功。
-		// 当我们到达堆栈中每个页面的末尾时，向上移动堆栈。
+		// 当到达堆栈中每个页面的末尾时，向上移动堆栈。
 		var i int
 		for i = len(c.stack) - 1; i >= 0; i-- {
 			elem := &c.stack[i]
@@ -229,7 +224,7 @@ func (c *Cursor) next() (key []byte, value []byte, flags uint32) {
 			return nil, nil, 0
 		}
 
-		// 否则从我们在堆栈中停止的地方开始，找到第一个叶子页面的第一个元素
+		// 否则从在堆栈中停止的地方开始，找到第一个叶子页面的第一个元素
 		c.stack = c.stack[:i+1]
 		c.first()
 

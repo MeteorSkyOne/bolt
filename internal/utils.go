@@ -8,16 +8,12 @@ import (
 	"unsafe"
 )
 
-// maxMapSize 表示 kvdb 支持的最大 mmap 大小
+// kvdb 支持的最大 mmap 大小
 const maxMapSize = 0xFFFFFFFFFFFF // 256TB
 
-// maxAllocSize 是创建数组指针时使用的大小
+// 创建数组指针时使用的大小
 const maxAllocSize = 0x7FFFFFFF
 
-// brokenUnaligned 表示此架构上是否存在非对齐加载/存储问题
-var brokenUnaligned = false
-
-// flock 在文件描述符上获取咨询锁
 func flock(db *DB, mode os.FileMode, exclusive bool, timeout time.Duration) error {
 	var t time.Time
 	for {
@@ -45,12 +41,10 @@ func flock(db *DB, mode os.FileMode, exclusive bool, timeout time.Duration) erro
 	}
 }
 
-// funlock 释放文件描述符上的咨询锁
 func funlock(db *DB) error {
 	return syscall.Flock(int(db.file.Fd()), syscall.LOCK_UN)
 }
 
-// mmap 将数据库的数据文件映射到内存
 func mmap(db *DB, sz int) error {
 	// 将数据文件映射到内存
 	b, err := syscall.Mmap(int(db.file.Fd()), 0, sz, syscall.PROT_READ, syscall.MAP_SHARED|db.MmapFlags)
@@ -70,7 +64,6 @@ func mmap(db *DB, sz int) error {
 	return nil
 }
 
-// munmap 从内存中取消映射数据库的数据文件
 func munmap(db *DB) error {
 	// 如果没有映射数据则忽略取消映射操作
 	if db.dataref == nil {
@@ -85,7 +78,6 @@ func munmap(db *DB) error {
 	return err
 }
 
-// 注意：此函数从标准库复制而来，因为在 darwin 上不可用
 func madvise(b []byte, advice int) (err error) {
 	_, _, e1 := syscall.Syscall(syscall.SYS_MADVISE, uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)), uintptr(advice))
 	if e1 != 0 {
@@ -94,7 +86,6 @@ func madvise(b []byte, advice int) (err error) {
 	return
 }
 
-// fdatasync 将写入的数据刷新到文件描述符
 func fdatasync(db *DB) error {
 	return db.file.Sync()
 }

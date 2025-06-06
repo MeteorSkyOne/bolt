@@ -1114,7 +1114,7 @@ func (cn *CoordinatorNode) RegisterServer(ctx context.Context, req *pb.RegisterR
 	}
 	grpcPort := strconv.Itoa(portNum + 100)
 	cn.mu.Lock()
-	// 注意：不使用defer，因为我们需要在方法中间释放锁
+	// 注意：不使用defer，因为需要在方法中间释放锁
 
 	// 检查是否为重复注册
 	existingNode, exists := cn.serverNodes[req.NodeId]
@@ -1301,7 +1301,7 @@ func (cn *CoordinatorNode) RegisterServer(ctx context.Context, req *pb.RegisterR
 		}
 	}
 
-	// 由于我们手动释放了锁，这里不需要defer unlock
+	// 由于手动释放了锁，这里不需要defer unlock
 	return &pb.RegisterResponse{
 		Success: true,
 		Role:    node.Role.String(),

@@ -14,78 +14,47 @@ import (
 	"unsafe"
 )
 
-// mmap重新映射时可以采取的最大步骤。
 const maxMmapStep = 1 << 30 // 1GB
 
-// 数据文件格式版本。
 const version = 2
 
-// kvdb的魔数
-const magic uint32 = 0xED0CDAED
+const magic uint32 = 0x36E0E4DF
 
-// IgnoreNoSync 指定在将更改同步到文件时是否忽略DB的NoSync字段。
-// 这是必需的，因为某些操作系统（如OpenBSD）没有统一的缓冲区缓存（UBC），
-// 写入必须使用msync(2)系统调用进行同步。
-const IgnoreNoSync = runtime.GOOS == "openbsd"
-
-// 如果在DB实例中未设置，则为默认值。
 const (
 	DefaultMaxBatchSize  int = 1000
 	DefaultMaxBatchDelay     = 10 * time.Millisecond
 	DefaultAllocSize         = 16 * 1024 * 1024
 )
 
-// db的默认页面大小设置为操作系统页面大小。
-var defaultPageSize = os.Getpagesize()
-
 // DB表示持久化到磁盘文件的桶的集合。
 // 所有数据访问都通过可以从DB获取的事务执行。
 // 在调用Open()之前访问DB上的所有函数都将返回ErrDatabaseNotOpen。
 type DB struct {
-	// 启用后，数据库将在每次提交后执行Check()。
-	// 如果数据库处于不一致状态，则会引发panic。
-	// 此标志会对性能产生较大影响，因此只应在调试时使用。
+	// for debug only
 	StrictMode bool
 
-	// 设置NoSync标志将导致数据库在每次提交后跳过fsync()调用。
-	// 这在将数据批量加载到数据库中并且可以在系统故障或数据库损坏的情况下重新启动批量加载时很有用。
-	// 正常使用时请勿设置此标志。
-	//
-	// 如果包全局常量IgnoreNoSync为true，则此值将被忽略。有关更多详细信息，请参阅该常量的注释。
-	//
-	// 这是不安全的。请谨慎使用。
+	// for debug only
 	NoSync bool
 
-	// 如果为true，则在增长数据库时跳过truncate调用。
-	// 仅在非ext3/ext4系统上将此设置为true是安全的。
-	// 跳过截断可避免硬盘空间的预分配，并在重新映射时绕过truncate()和fsync()系统调用。
+	// for debug only
 	NoGrowSync bool
 
-	// 如果您想快速读取整个数据库，可以在Linux 2.6.23+上将MmapFlag设置为syscall.MAP_POPULATE以进行顺序预读。
 	MmapFlags int
 
-	// MaxBatchSize是批处理的最大大小。默认值是从Open中的DefaultMaxBatchSize复制的。
-	//
-	// 如果<=0，则禁用批处理。
-	//
-	// 不要与对Batch的调用并发更改。
+	// 批处理的最大大小, 如果<=0，则禁用
 	MaxBatchSize int
 
-	// MaxBatchDelay是批处理开始前的最大延迟。默认值是从Open中的DefaultMaxBatchDelay复制的。
-	//
-	// 如果<=0，则有效禁用批处理。
-	//
-	// 不要与对Batch的调用并发更改。
+	// 批处理开始前的最大延迟, 如果<=0，则有效禁用批处理
 	MaxBatchDelay time.Duration
 
 	// AllocSize是数据库需要创建新页面时分配的空间量。
-	// 这样做是为了在增长数据文件时分摊truncate()和fsync()的成本。
+	// 为了在增长数据文件时分摊truncate()和fsync()的成本。
 	AllocSize int
 
 	path     string
 	file     *os.File
-	lockfile *os.File // 仅windows
-	dataref  []byte   // mmap的只读数据，写入会抛出SEGV
+	lockfile *os.File
+	dataref  []byte // mmap的只读数据，写入会抛出SEGV
 	data     *[maxMapSize]byte
 	datasz   int
 	filesz   int // 当前磁盘文件大小
@@ -138,7 +107,6 @@ func (db *DB) String() string {
 func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	var db = &DB{opened: true}
 
-	// 如果未提供选项，则设置默认选项。
 	if options == nil {
 		options = DefaultOptions
 	}
@@ -176,7 +144,7 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	// 测试钩子的默认值
 	db.ops.writeAt = db.file.WriteAt
 
-	// 如果数据库不存在，则初始化它。
+	// 如果数据库不存在，则初始化
 	if info, err := db.file.Stat(); err != nil {
 		return nil, err
 	} else if info.Size() == 0 {
@@ -190,9 +158,9 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 		if _, err := db.file.ReadAt(buf[:], 0); err == nil {
 			m := db.pageInBuffer(buf[:], 0).meta()
 			if err := m.validate(); err != nil {
-				// 如果我们无法读取页面大小，我们可以假设它与操作系统相同——因为页面大小最初就是这样选择的。
+				// 如果无法读取页面大小，可以假设它与操作系统相同——因为页面大小最初就是这样选择的。
 				//
-				// 如果第一个页面无效，并且此操作系统使用的页面大小与创建数据库时使用的页面大小不同，那么我们就无法访问数据库。
+				// 如果第一个页面无效，并且此操作系统使用的页面大小与创建数据库时使用的页面大小不同，那么就无法访问数据库。
 				db.pageSize = os.Getpagesize()
 			} else {
 				db.pageSize = int(m.pageSize)
@@ -263,8 +231,8 @@ func (db *DB) mmap(minsz int) error {
 	db.meta0 = db.page(0).meta()
 	db.meta1 = db.page(1).meta()
 
-	// 验证元页面。我们仅在两个元页面都验证失败时返回错误，
-	// 因为meta0验证失败意味着它没有正确保存——但我们可以使用meta1恢复。反之亦然。
+	// 验证元页面。仅在两个元页面都验证失败时返回错误，
+	// 因为meta0验证失败意味着它没有正确保存——但可以使用meta1恢复。反之亦然。
 	err0 := db.meta0.validate()
 	err1 := db.meta1.validate()
 	if err0 != nil && err1 != nil {
@@ -305,13 +273,13 @@ func (db *DB) mmapSize(size int) (int, error) {
 	}
 
 	// 确保mmap大小是页面大小的倍数。
-	// 这应该始终为true，因为我们以MB为单位递增。
+	// 这应该始终为true，因为以MB为单位递增。
 	pageSize := int64(db.pageSize)
 	if (sz % pageSize) != 0 {
 		sz = ((sz / pageSize) + 1) * pageSize
 	}
 
-	// 如果我们超过了最大大小，则只增长到最大大小。
+	// 如果超过了最大大小，则只增长到最大大小。
 	if sz > maxMapSize {
 		sz = maxMapSize
 	}
@@ -324,7 +292,7 @@ func (db *DB) init() error {
 	// 将页面大小设置为操作系统页面大小。
 	db.pageSize = os.Getpagesize()
 
-	// 在缓冲区上创建两个元页面。
+	// 在缓冲区上创建两个元页面
 	buf := make([]byte, db.pageSize*4)
 	for i := 0; i < 2; i++ {
 		p := db.pageInBuffer(buf[:], pgid(i))
@@ -343,19 +311,19 @@ func (db *DB) init() error {
 		m.checksum = m.sum64()
 	}
 
-	// 在第3页上写入一个空的freelist。
+	// 在第3页上写入一个空的freelist
 	p := db.pageInBuffer(buf[:], pgid(2))
 	p.id = pgid(2)
 	p.flags = freelistPageFlag
 	p.count = 0
 
-	// 在第4页上写入一个空的叶子页。
+	// 在第4页上写入一个空的叶子页
 	p = db.pageInBuffer(buf[:], pgid(3))
 	p.id = pgid(3)
 	p.flags = leafPageFlag
 	p.count = 0
 
-	// 将缓冲区写入我们的数据文件。
+	// 将缓冲区写入数据文件。
 	if _, err := db.ops.writeAt(buf, 0); err != nil {
 		return err
 	}
@@ -431,10 +399,7 @@ func (db *DB) close() error {
 // 事务不应相互依赖。在同一个goroutine中打开读事务和写事务可能导致写程序死锁，
 // 因为数据库需要定期在增长时重新mmap自身，而在读事务打开时无法执行此操作。
 //
-// 如果需要长时间运行的读事务（例如，快照事务），
-// 您可能需要将DB.InitialMmapSize设置为足够大的值，以避免写事务的潜在阻塞。
-//
-// 重要提示：完成后必须关闭只读事务，否则数据库将不会回收旧页面。
+// 完成后必须关闭只读事务，否则数据库将不会回收旧页面。
 func (db *DB) Begin(writable bool) (*Tx, error) {
 	if writable {
 		return db.beginRWTx()
@@ -443,7 +408,7 @@ func (db *DB) Begin(writable bool) (*Tx, error) {
 }
 
 func (db *DB) beginTx() (*Tx, error) {
-	// 在初始化事务时锁定元页面。我们在mmap锁之前获取元锁，
+	// 在初始化事务时锁定元页面。在mmap锁之前获取元锁，
 	// 因为这是写事务获取它们的顺序。
 	db.metalock.Lock()
 
@@ -451,7 +416,7 @@ func (db *DB) beginTx() (*Tx, error) {
 	// 因此所有事务都必须在它可以被重新映射之前完成。
 	db.mmaplock.RLock()
 
-	// 如果数据库尚未打开，则退出。
+	// 检测数据库是否打开。
 	if !db.opened {
 		db.mmaplock.RUnlock()
 		db.metalock.Unlock()
@@ -488,11 +453,11 @@ func (db *DB) beginRWTx() (*Tx, error) {
 	// 这强制一次只有一个写入器事务。
 	db.rwlock.Lock()
 
-	// 一旦我们有了写入器锁，我们就可以锁定元页面，以便我们可以设置事务。
+	// 一旦有了写入器锁，就可以锁定元页面，以便设置事务。
 	db.metalock.Lock()
 	defer db.metalock.Unlock()
 
-	// 如果数据库尚未打开，则退出。
+	// 检测数据库是否打开。
 	if !db.opened {
 		db.rwlock.Unlock()
 		return nil, ErrDatabaseNotOpen
@@ -694,7 +659,7 @@ retry:
 
 		if failIdx >= 0 {
 			// 从批处理中取出失败的事务。
-			// 在这里缩短b.calls是安全的，因为db.batch不再指向我们，而且我们无论如何都持有互斥锁。
+			// 在这里缩短b.calls是安全的，因为db.batch不再指向，而且无论如何都持有互斥锁。
 			c := b.calls[failIdx]
 			b.calls[failIdx], b.calls = b.calls[len(b.calls)-1], b.calls[:len(b.calls)-1]
 			// 告诉提交者单独重新运行它，继续处理批处理的其余部分
@@ -710,7 +675,6 @@ retry:
 	}
 }
 
-// trySolo 是一个特殊的哨兵错误值，用于表示应重新运行事务函数。调用者不应看到它。
 var trySolo = errors.New("batch function returned an error and should be re-run solo")
 
 type panicked struct {
@@ -734,9 +698,6 @@ func safelyCall(fn func(*Tx) error, tx *Tx) (err error) {
 }
 
 // Sync 对数据库文件句柄执行fdatasync()。
-//
-// 在正常操作下这不是必需的，但是，如果使用NoSync，
-// 则它允许您强制数据库文件与磁盘同步。
 func (db *DB) Sync() error { return fdatasync(db) }
 
 // Stats 检索数据库的持续性能统计信息。
@@ -765,8 +726,8 @@ func (db *DB) pageInBuffer(b []byte, id pgid) *page {
 
 // meta检索当前的元页面引用。
 func (db *DB) meta() *meta {
-	// 我们必须返回具有最高txid且未通过验证的元数据。
-	// 否则，当数据库实际上处于一致状态时，我们可能会导致错误。metaA是具有较高txid的那个。
+	// 必须返回具有最高txid且未通过验证的元数据。
+	// 否则，当数据库实际上处于一致状态时，可能会导致错误。metaA是具有较高txid的那个。
 	metaA := db.meta0
 	metaB := db.meta1
 	if db.meta1.txid > db.meta0.txid {
@@ -781,7 +742,7 @@ func (db *DB) meta() *meta {
 		return metaB
 	}
 
-	// 这永远不应该被达到，因为meta1和meta0都在mmap()上得到了验证，并且我们每次写入都会执行fsync()。
+	// 不可达
 	panic("kvdb.DB.meta(): invalid meta pages")
 }
 
@@ -802,7 +763,7 @@ func (db *DB) allocate(count int) (*page, error) {
 		return p, nil
 	}
 
-	// 如果我们到达了结尾，则调整mmap()的大小。
+	// 如果到达了结尾，则调整mmap()的大小。
 	p.id = db.rwtx.meta.pgid
 	var minsz = int((p.id+pgid(count))+1) * db.pageSize
 	if minsz >= db.datasz {
@@ -861,16 +822,14 @@ type Options struct {
 	// 在内存映射文件之前设置DB.NoGrowSync标志。
 	NoGrowSync bool
 
-	// 以只读模式打开数据库。使用flock(..., LOCK_SH |LOCK_NB)来获取共享锁(UNIX)。
+	// 以只读模式打开数据库
 	ReadOnly bool
 
 	// 在内存映射文件之前设置DB.MmapFlags标志。
 	MmapFlags int
 
-	// InitialMmapSize是数据库的初始mmap大小（以字节为单位）。
+	// InitialMmapSize是数据库的初始mmap大小（字节）。
 	// 如果InitialMmapSize足够大以容纳数据库mmap大小，则读事务不会阻塞写事务。
-	// (有关更多信息，请参见DB.Begin)
-	//
 	// 如果<=0，则初始映射大小为0。
 	// 如果initialMmapSize小于以前的数据库大小，则它不起作用。
 	InitialMmapSize int
@@ -960,7 +919,7 @@ func (m *meta) write(p *page) {
 		panic(fmt.Sprintf("freelist pgid (%d) above high water mark (%d)", m.freelist, m.pgid))
 	}
 
-	// 页面id可以是0或1，我们可以通过事务ID来确定。
+	// 页面id可以是0或1，可以通过事务ID来确定。
 	p.id = pgid(m.txid % 2)
 	p.flags |= metaPageFlag
 
