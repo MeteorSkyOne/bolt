@@ -1,6 +1,0 @@
----
-description: 
-globs: 
-alwaysApply: true
----
-this project is based on boltdb and every action you take should try your best to reuse functions that the project already have instead of makeing a brand new feature but the same function that project have
